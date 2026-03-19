@@ -30,7 +30,7 @@ API_KEY = os.environ.get("BASE44_API_KEY", "YOUR_API_KEY_HERE")
 BASE44_URL = f"https://preview--matter-track-pro.base44.app/api/apps/{APP_ID}/entities"
 
 # Court display board URL
-DISPLAY_BOARD_URL = "https://www.phhc.gov.in/home.php?search_param=display"
+DISPLAY_BOARD_URL = "https://livedb9010.digitalls.in/display_board/public/getRecords?skip=0&limit=500"
 
 # How often to scrape (seconds) — board refreshes every 30s
 SCRAPE_INTERVAL = 30
@@ -51,82 +51,59 @@ HEADERS = {
 
 def scrape_display_board():
     """
-    Fetches the PHHC display board and returns a dict of:
+    Fetches the PHHC display board from the new JSON API.
+    Returns a dict of:
     { court_number (int): { "current_item": int, "is_passover": bool,
                             "passover_current": int, "passover_total": int } }
-    Returns None if court is not in session or fetch fails.
+    Returns None if fetch fails, empty dict if court not in session.
     """
+    headers = {
+        "Referer": "https://new.phhc.gov.in/",
+        "Origin": "https://new.phhc.gov.in",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
     try:
-        response = requests.get(DISPLAY_BOARD_URL, timeout=15)
+        response = requests.get(DISPLAY_BOARD_URL, headers=headers, timeout=15)
         response.raise_for_status()
+        payload = response.json()
     except requests.RequestException as e:
         print(f"[ERROR] Could not fetch display board: {e}")
         return None
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    records = payload.get("data", [])
 
-    # Check if court is not in session
-    page_text = soup.get_text()
-    if "Court is not in Session" in page_text:
+    if not records:
         print("[INFO] Court is not in session.")
-        return {}  # Empty dict = not in session
+        return {}
 
     court_data = {}
-
-    # Find all table rows containing court data
-    # The page structure: <td> with court number link, <td> with SR number
-    # Court number is inside an <a> tag with onclick="court_no_wise_display('X',...)"
-    # SR number is in the next <td>
-
-    links = soup.find_all("a", onclick=re.compile(r"court_no_wise_display"))
-
-    for link in links:
+    for record in records:
         try:
-            # Extract court number from the link text
-            court_number = int(link.get_text(strip=True))
+            court_number = int(record["court_no"])
+            sr_raw = str(record["sr_no"]).strip()
 
-            # The SR number is in the next <td> sibling
-            parent_td = link.find_parent("td")
-            if not parent_td:
-                continue
-
-            next_td = parent_td.find_next_sibling("td")
-            if not next_td:
-                continue
-
-            sr_raw = next_td.get_text(strip=True)
-
-            # Parse SR number — handle passover format like "103-P(1/2)"
             is_passover = False
             passover_current = None
             passover_total = None
             current_item = 0
 
             if "-P(" in sr_raw:
-                # Passover format: "103-P(1/2)"
                 is_passover = True
                 parts = sr_raw.split("-P(")
-                current_item = int(parts[0])  # The passed-over item number
-                # Extract (1/2) -> current=1, total=2
-                passover_part = parts[1].rstrip(")")
-                p_nums = passover_part.split("/")
+                current_item = int(parts[0])
+                p_nums = parts[1].rstrip(")").split("/")
                 passover_current = int(p_nums[0])
                 passover_total = int(p_nums[1])
             elif "-S(" in sr_raw:
-                # Similar format for other special cases
                 is_passover = True
                 parts = sr_raw.split("-S(")
                 current_item = int(parts[0])
-                passover_part = parts[1].rstrip(")")
-                p_nums = passover_part.split("/")
+                p_nums = parts[1].rstrip(")").split("/")
                 passover_current = int(p_nums[0])
                 passover_total = int(p_nums[1])
             else:
-                # Plain number
-                # Remove any non-numeric characters just in case
-                clean = re.sub(r"[^\d]", "", sr_raw)
-                if clean:
-                    current_item = int(clean)
+                current_item = int(re.sub(r"[^\d]", "", sr_raw) or 0)
 
             court_data[court_number] = {
                 "current_item": current_item,
@@ -134,9 +111,7 @@ def scrape_display_board():
                 "passover_current": passover_current,
                 "passover_total": passover_total
             }
-
-        except (ValueError, AttributeError) as e:
-            # Skip any row that can't be parsed cleanly
+        except (ValueError, KeyError):
             continue
 
     print(f"[INFO] Scraped {len(court_data)} courts from display board.")
