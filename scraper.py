@@ -27,7 +27,7 @@ APP_ID  = os.environ.get("BASE44_APP_ID",  "YOUR_APP_ID_HERE")
 API_KEY = os.environ.get("BASE44_API_KEY", "YOUR_API_KEY_HERE")
 
 # Base44 API base URL
-BASE44_URL = f"https://api.base44.com/v1/apps/{APP_ID}/entities"
+BASE44_URL = f"https://preview-sandbox--{APP_ID}.base44.app/api/apps/{APP_ID}/entities"
 
 # Court display board URL
 DISPLAY_BOARD_URL = "https://www.phhc.gov.in/home.php?search_param=display"
