@@ -14,7 +14,6 @@ import requests
 import datetime
 import time
 import re
-from bs4 import BeautifulSoup
 
 # ============================================================
 # CONFIGURATION — Replace these with your real values
