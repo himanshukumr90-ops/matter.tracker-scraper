@@ -26,7 +26,7 @@ APP_ID  = os.environ.get("BASE44_APP_ID",  "YOUR_APP_ID_HERE")
 API_KEY = os.environ.get("BASE44_API_KEY", "YOUR_API_KEY_HERE")
 
 # Base44 API base URL
-BASE44_URL = f"https://app.base44.com/api/apps/{APP_ID}/entities"
+BASE44_URL = f"https://preview--matter-track-pro.base44.app/api/apps/{APP_ID}/entities"
 
 # Court display board URL
 DISPLAY_BOARD_URL = "https://livedb9010.digitalls.in/display_board/public/getRecords?skip=0&limit=500"
@@ -39,7 +39,7 @@ THRESHOLDS = [15, 10, 5]
 
 # Headers for Base44 API
 HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
+    "api_key": API_KEY,
     "Content-Type": "application/json"
 }
 
