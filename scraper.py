@@ -6,17 +6,14 @@ This script runs 24/7 on Railway.app and does the following every 30 seconds:
 2. Parses all 69 courts and their current SR (item) numbers
 3. Writes the data into Base44's CourtStatus table
 4. Checks all tracked cases and logs notifications when thresholds are hit
-5. Scrapes cause lists (ORDINARY/URGENT) for upcoming dates and stores entries
+5. Scrapes cause lists via direct JSON API (no PDF, no Cloudflare) and stores entries
 
 Author: Built with Claude for MatterTracker
 """
 import requests
-import cloudscraper
 import datetime
 import time
 import re
-import io
-import pdfplumber
 from datetime import timedelta, timezone
 
 # ============================================================
@@ -36,18 +33,41 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Cause list config
+# Cause list config ‚Äî uses livedb9010.digitalls.in (no Cloudflare, accessible from Railway)
 IST = timezone(timedelta(hours=5, minutes=30))
-CAUSELIST_SUMMARY_URL = "https://livedb9010.digitalls.in/cis_filing/public/getCauseListSummary"
-CAUSELIST_PAGE_URL = "https://new.phhc.gov.in/cause/daily-cause-list"
-CAUSELIST_PDF_URL = "https://new.phhc.gov.in/api/causelist/daily-cause-list-pdf"
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+LIVEDB_BASE = "https://livedb9010.digitalls.in"
+CAUSELIST_SUMMARY_URL = f"{LIVEDB_BASE}/cis_filing/public/getCauseListSummary"
+CAUSELIST_ENTRIES_URL = f"{LIVEDB_BASE}/cis_filing/public/getCauseList"
+ACTIVE_BENCH_URL = f"{LIVEDB_BASE}/cis/judges/active-bench"
+
+LIVEDB_HEADERS = {
+    "Accept": "application/json",
+    "Origin": "https://new.phhc.gov.in",
+    "Referer": "https://new.phhc.gov.in/",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+# Map cl_type codes to human-readable names
+CL_TYPE_NAMES = {
+    'U': 'URGENT',
+    'O': 'ORDINARY',
+    'K': 'LOK ADALAT',
+    'S': 'SPECIAL',
+    'E': 'ELECTION',
+    'Q': 'LIQUIDATION (URGENT)',
+    'L': 'LIQUIDATION (ORDINARY)',
+    'F': 'COMMERCIAL (URGENT)',
+    'G': 'COMMERCIAL (ORDINARY)',
+    'T': 'TAKENUP',
+    'Y': 'FOR-ORDER',
+    'V': 'OLD-CASES',
+    'M': 'MEDIATION DRIVE',
+    'R': 'REGULAR',
+    'A': 'PRE LOK ADALAT',
 }
 
 # In-memory cache of already-processed (list_date, list_type) pairs
-# Avoids re-checking Base44 on every 30-second cycle
+# Avoids re-fetching entries we've already stored in Base44
 _cause_list_cache = set()
 _cache_initialized = False
 
@@ -378,197 +398,8 @@ def reset_daily_flags():
 
 
 # ============================================================
-# STEP 6 ‚Äî CAUSE LIST SCRAPING
+# STEP 6 ‚Äî CAUSE LIST SCRAPING (JSON API ‚Äî no PDF, no Cloudflare)
 # ============================================================
-def get_csrt_token():
-    """Obtain a fresh csrt token from the PHHC cause list page using cloudscraper
-    to bypass Cloudflare anti-bot protection."""
-    try:
-        # cloudscraper handles Cloudflare JavaScript challenges automatically
-        session = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'darwin',
-                'desktop': True
-            }
-        )
-        resp = session.get(CAUSELIST_PAGE_URL, headers=BROWSER_HEADERS, timeout=60)
-        resp.raise_for_status()
-
-        # Search for csrt token in hidden input
-        match = re.search(
-            r'<input[^>]+name=["\']csrt["\'][^>]+value=["\']([^"\']+)["\']',
-            resp.text
-        )
-        if not match:
-            match = re.search(
-                r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']csrt["\']',
-                resp.text
-            )
-
-        if match:
-            csrt = match.group(1)
-            print(f"[CAUSELIST] Got csrt token: {csrt[:10]}...")
-            return session, csrt
-        else:
-            print("[CAUSELIST] ERROR: csrt token not found in page HTML")
-            print(f"[CAUSELIST] Page preview: {resp.text[:300]}")
-            return None, None
-    except Exception as e:
-        print(f"[CAUSELIST] ERROR getting csrt token: {e}")
-        return None, None
-
-
-def get_cause_list_summary(cl_date):
-    """Fetch cause list summary for a given date from the PHHC internal API."""
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://new.phhc.gov.in",
-        "Referer": "https://new.phhc.gov.in/",
-    }
-    try:
-        resp = requests.get(
-            CAUSELIST_SUMMARY_URL,
-            params={"cl_date": cl_date, "skip": 0, "limit": 100},
-            headers=headers,
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            return []
-        return resp.json()
-    except Exception as e:
-        print(f"[CAUSELIST] Summary API error for {cl_date}: {e}")
-        return []
-
-
-def download_cause_list_pdf(session, csrt, cl_date, list_type, main_suppl):
-    """Download a cause list PDF using the authenticated session. Returns bytes or None."""
-    date_underscored = cl_date.replace("-", "_")
-    params = {
-        "cl_date": date_underscored,
-        "list_type": list_type,
-        "main_suppl": main_suppl,
-        "csrt": csrt,
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-        "Accept": "application/pdf,*/*",
-        "Referer": "https://new.phhc.gov.in/cause/daily-cause-list",
-    }
-    try:
-        resp = session.get(CAUSELIST_PDF_URL, params=params, headers=headers, timeout=120)
-        if resp.status_code == 200 and len(resp.content) > 1000:
-            print(f"[CAUSELIST] Downloaded PDF: {len(resp.content)} bytes")
-            return resp.content
-        else:
-            print(f"[CAUSELIST] PDF download failed: status={resp.status_code}, size={len(resp.content)}")
-            return None
-    except Exception as e:
-        print(f"[CAUSELIST] PDF download error: {e}")
-        return None
-
-
-def parse_cause_list_pdf(pdf_bytes, list_date, list_type_name):
-    """Parse a cause list PDF and extract all case entries."""
-    entries = []
-    current_court = None
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text:
-                    continue
-                lines = text.split("\n")
-                for i, raw_line in enumerate(lines):
-                    line = raw_line.strip()
-
-                    # Court header: "CR NO X" or "CR NO. X"
-                    court_match = re.search(r'CR\s+NO\.?\s*(\d+)', line, re.IGNORECASE)
-                    if court_match:
-                        current_court = int(court_match.group(1))
-                        continue
-
-                    # Case entry (starts with 3-digit item number)
-                    entry_match = re.match(r'^(\d{3})\s+', line)
-                    if entry_match and current_court is not None:
-                        item_number = int(entry_match.group(1))
-                        if 100 <= item_number <= 999:
-                            entry = parse_entry_line(
-                                line, lines, i, item_number,
-                                current_court, list_date, list_type_name
-                            )
-                            if entry:
-                                entries.append(entry)
-    except Exception as e:
-        print(f"[CAUSELIST] PDF parse error: {e}")
-    return entries
-
-
-def parse_entry_line(line, lines, line_idx, item_number, court_number, list_date, list_type_name):
-    """Parse a single cause list entry line."""
-    try:
-        remainder = re.sub(r'^\d{3}\s+', '', line)
-
-        # Bench type
-        bench_match = re.match(r'^(I{1,3}|IV|V)\s+', remainder)
-        bench_type = ""
-        if bench_match:
-            bench_type = bench_match.group(1)
-            remainder = remainder[bench_match.end():]
-
-        # Case number: TYPE-NUMBER-YEAR
-        case_match = re.search(r'([A-Z][A-Z0-9]*(?:-[A-Z]+)*)-(\d+)-(\d{4})', remainder)
-        if not case_match:
-            return None
-
-        full_case_number = case_match.group(0)
-        case_start = case_match.start()
-        case_end = case_match.end()
-        district = remainder[:case_start].strip().rstrip("-").strip()
-        parties = remainder[case_end:].strip()
-
-        # Gather continuation lines
-        j = line_idx + 1
-        while j < len(lines):
-            next_line = lines[j].strip()
-            if re.match(r'^\d{3}\s+', next_line):
-                break
-            if re.search(r'CR\s+NO\.?\s*\d+', next_line, re.IGNORECASE):
-                break
-            if re.match(r'^HON\'?BLE', next_line, re.IGNORECASE):
-                break
-            if re.match(r'^DAILY\s+', next_line, re.IGNORECASE):
-                break
-            if next_line and not next_line.startswith('[') and not next_line.startswith('('):
-                parties += " " + next_line
-            j += 1
-
-        # Split case number into parts
-        parts = full_case_number.split("-")
-        case_year = int(parts[-1])
-        case_no = int(parts[-2])
-        case_type = "-".join(parts[:-2])
-
-        now = datetime.datetime.now(IST).isoformat(timespec='seconds')
-
-        return {
-            "case_number": full_case_number.upper(),
-            "case_type": case_type,
-            "case_no": case_no,
-            "case_year": case_year,
-            "court_number": court_number,
-            "item_number": item_number,
-            "list_date": list_date,
-            "list_type": list_type_name,
-            "bench_type": bench_type,
-            "district": district,
-            "parties": re.sub(r'\s+', ' ', parties).strip()[:500],
-            "downloaded_at": now,
-        }
-    except Exception:
-        return None
-
 
 def _load_cause_list_cache():
     """Load already-processed (list_date, list_type) pairs from Base44 into memory cache."""
@@ -589,17 +420,140 @@ def _load_cause_list_cache():
                     lt = r.get("list_type")
                     if ld and lt:
                         _cause_list_cache.add((ld, lt))
-                print(f"[CAUSELIST] Loaded {len(_cause_list_cache)} cached (date, type) pairs from Base44")
+                print(f"[CAUSELIST] Loaded cache: {len(_cause_list_cache)} (date, type) pairs from Base44")
         _cache_initialized = True
     except Exception as e:
         print(f"[CAUSELIST] Cache load error: {e}")
 
 
 def check_existing_cause_list(list_date, list_type):
-    """Check if CauseListEntry records already exist for this date+type.
-    Uses an in-memory cache to avoid querying Base44 on every 30-second cycle."""
+    """Check in-memory cache whether this (date, list_type) has already been stored."""
     _load_cause_list_cache()
     return (list_date, list_type) in _cause_list_cache
+
+
+def get_cause_list_summary(cl_date):
+    """Fetch cause list summary for a given date. Returns list of dicts or []."""
+    try:
+        resp = requests.get(
+            CAUSELIST_SUMMARY_URL,
+            params={"cl_date": cl_date, "skip": 0, "limit": 100},
+            headers=LIVEDB_HEADERS,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return []
+        return resp.json()
+    except Exception as e:
+        print(f"[CAUSELIST] Summary API error for {cl_date}: {e}")
+        return []
+
+
+def get_active_bench_ids():
+    """Fetch all active bench/judge IDs from PHHC. Returns list of judge_code ints."""
+    try:
+        resp = requests.get(ACTIVE_BENCH_URL, headers=LIVEDB_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        ids = [item['judge_code'] for item in data if item.get('bench_active') == 'Y']
+        print(f"[CAUSELIST] Found {len(ids)} active bench IDs")
+        return ids
+    except Exception as e:
+        print(f"[CAUSELIST] Error fetching bench IDs: {e}")
+        return []
+
+
+def fetch_cause_list_for_bench(bench_judge_id, date_str):
+    """
+    Fetch cause list JSON for a specific bench on a given date.
+    Returns a list of bench-section dicts (each has 'header' and 'records').
+    """
+    try:
+        resp = requests.get(
+            CAUSELIST_ENTRIES_URL,
+            params={
+                'cause_list_date': date_str,
+                'bench_judge_id': bench_judge_id,
+                'skip': 0,
+                'limit': 1000
+            },
+            headers=LIVEDB_HEADERS,
+            timeout=30
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except Exception as e:
+        print(f"[CAUSELIST] Bench {bench_judge_id} {date_str} error: {e}")
+        return []
+
+
+def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
+    """
+    Fetch all cause list entries for a given date by iterating over all benches.
+    Deduplicates by court_no to avoid storing the same court's list twice
+    (division benches have two judges but one court room).
+
+    Returns a flat list of entry dicts ready to POST to Base44.
+    """
+    all_entries = []
+    processed_courts = set()
+    now_ist = datetime.datetime.now(IST).isoformat(timespec='seconds')
+
+    for bench_id in bench_ids:
+        bench_sections = fetch_cause_list_for_bench(bench_id, date_str)
+        for section in bench_sections:
+            records = section.get('records', [])
+            if not records:
+                continue
+
+            # Use court_no from the first record to detect duplicates
+            court_no = records[0].get('court_no')
+            if court_no is None:
+                continue
+
+            if court_no in processed_courts:
+                continue  # This court was already processed via the other judge of the division bench
+            processed_courts.add(court_no)
+
+            for rec in records:
+                cl_type = rec.get('cl_type', '')
+                list_type_name = CL_TYPE_NAMES.get(cl_type, cl_type)
+
+                case_type = str(rec.get('case_type') or '')
+                case_no = str(rec.get('case_no') or '')
+                case_year = str(rec.get('case_year') or '')
+                case_number = f"{case_type}-{case_no}-{case_year}"
+
+                pet = (rec.get('pet_name') or '')[:200]
+                res = (rec.get('res_name') or '')[:200]
+                if pet and res:
+                    parties = f"{pet} vs {res}"
+                elif pet:
+                    parties = pet
+                elif res:
+                    parties = res
+                else:
+                    parties = ''
+
+                entry = {
+                    'case_number': case_number,
+                    'case_type': case_type,
+                    'case_no': case_no,
+                    'case_year': case_year,
+                    'court_number': court_no,
+                    'item_number': str(rec.get('sr_no') or ''),
+                    'list_date': date_str,
+                    'list_type': list_type_name,
+                    'bench_type': str(rec.get('bench_type') or ''),  # 'D'=division, 'S'=single
+                    'district': str(rec.get('main_suppl') or ''),   # 'M'=main, 'S'=supplementary
+                    'parties': parties[:500],
+                    'downloaded_at': now_ist,
+                }
+                all_entries.append(entry)
+
+    print(f"[CAUSELIST] Fetched {len(all_entries)} entries across {len(processed_courts)} courts for {date_str}")
+    return all_entries
 
 
 def store_cause_list_entries(entries):
@@ -629,66 +583,84 @@ def store_cause_list_entries(entries):
 
 
 def scrape_cause_lists():
-    """Main cause list scraping function. Checks today through today+3.
-    - Ordinary lists are published 2 days before the hearing date
-    - Urgent lists are published 1 day before the hearing date
+    """
+    Main cause list function. Uses direct JSON API on livedb9010.digitalls.in ‚Äî
+    no PDF download, no csrt token, no Cloudflare.
+
+    Checks today+0 through today+3 for available cause lists.
+    - ORDINARY lists are published ~2 days before the hearing date
+    - URGENT lists are published ~1 day before the hearing date
     """
     print("[CAUSELIST] Starting cause list check...")
     now_ist = datetime.datetime.now(IST)
 
-    # Check today through today+3 to catch all upcoming cause lists
+    # Check today through today+3
     dates_to_check = [
         (now_ist.date() + timedelta(days=d)).isoformat()
         for d in range(4)
     ]
 
-    session = None
-    csrt = None
+    bench_ids = None  # Fetched once and reused across all dates
 
     for cl_date in dates_to_check:
         try:
+            # Check summary to see what list types are available for this date
             summary = get_cause_list_summary(cl_date)
             if not summary:
+                continue  # No lists published for this date yet
+
+            # Determine which list types are available (from main lists only)
+            available_types = set()
+            for item in summary:
+                lt_name = item.get('list_type_name', '')
+                ms = item.get('main_suppl', '')
+                if ms == 'M' and lt_name in ('URGENT', 'ORDINARY'):
+                    available_types.add(lt_name)
+
+            if not available_types:
                 continue
 
-            for item in summary:
-                list_type_name = item.get("list_type_name", "")
-                main_suppl = item.get("main_suppl", "")
+            # Which types do we still need to fetch?
+            needed_types = {
+                lt for lt in available_types
+                if not check_existing_cause_list(cl_date, lt)
+            }
 
-                if list_type_name not in ("ORDINARY", "URGENT"):
+            if not needed_types:
+                print(f"[CAUSELIST] {cl_date}: all available types already stored, skipping")
+                continue
+
+            print(f"[CAUSELIST] {cl_date}: need to fetch {needed_types}")
+
+            # Fetch bench IDs once per scrape_cause_lists() call
+            if bench_ids is None:
+                bench_ids = get_active_bench_ids()
+
+            if not bench_ids:
+                print("[CAUSELIST] No bench IDs ‚Äî cannot fetch cause lists")
+                return
+
+            # Fetch ALL entries for this date (one pass over all benches)
+            all_entries = fetch_all_cause_list_entries_for_date(cl_date, bench_ids)
+
+            if not all_entries:
+                print(f"[CAUSELIST] No entries returned for {cl_date}")
+                continue
+
+            # Store entries for each needed list type separately
+            for lt in needed_types:
+                entries_for_type = [e for e in all_entries if e['list_type'] == lt]
+                if not entries_for_type:
+                    print(f"[CAUSELIST] {cl_date}: no {lt} entries in API response")
                     continue
-                if main_suppl != "M":
-                    continue
 
-                # Check in-memory cache first (avoids redundant Base44 API calls)
-                if check_existing_cause_list(cl_date, list_type_name):
-                    print(f"[CAUSELIST] {list_type_name} {cl_date} already stored, skipping")
-                    continue
+                courts = set(e['court_number'] for e in entries_for_type)
+                print(f"[CAUSELIST] {lt} {cl_date}: {len(entries_for_type)} entries across {len(courts)} courts")
 
-                # Need to download ‚Äî get session/token if not already obtained
-                if session is None or csrt is None:
-                    session, csrt = get_csrt_token()
-                if not csrt:
-                    print("[CAUSELIST] Cannot proceed without csrt token")
-                    return
-
-                lt = "o" if list_type_name == "ORDINARY" else "u"
-                pdf_bytes = download_cause_list_pdf(session, csrt, cl_date, lt, "m")
-                if not pdf_bytes:
-                    continue
-
-                entries = parse_cause_list_pdf(pdf_bytes, cl_date, list_type_name)
-                if not entries:
-                    print(f"[CAUSELIST] No entries parsed from {list_type_name} {cl_date}")
-                    continue
-
-                courts = set(e["court_number"] for e in entries)
-                print(f"[CAUSELIST] {list_type_name} {cl_date}: {len(entries)} entries across {len(courts)} courts")
-
-                stored = store_cause_list_entries(entries)
+                stored = store_cause_list_entries(entries_for_type)
                 if stored > 0:
-                    # Update in-memory cache so we don't re-process this
-                    _cause_list_cache.add((cl_date, list_type_name))
+                    _cause_list_cache.add((cl_date, lt))
+                    print(f"[CAUSELIST] Cached ({cl_date}, {lt})")
 
         except Exception as e:
             print(f"[CAUSELIST] Error processing {cl_date}: {e}")
