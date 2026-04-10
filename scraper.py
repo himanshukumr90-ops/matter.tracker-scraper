@@ -2,7 +2,6 @@
 MatterTracker ‚Äî PHHC Display Board & Cause List Scraper
 ==========================================
 This script runs 24/7 on Railway.app and does the following every 30 seconds:
-
 1. Scrapes the Punjab & Haryana High Court display board
 2. Parses all 69 courts and their current SR (item) numbers
 3. Writes the data into Base44's CourtStatus table
@@ -11,8 +10,8 @@ This script runs 24/7 on Railway.app and does the following every 30 seconds:
 
 Author: Built with Claude for MatterTracker
 """
-
 import requests
+import cloudscraper
 import datetime
 import time
 import re
@@ -23,13 +22,12 @@ from datetime import timedelta, timezone
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
 import os
 
 APP_ID = os.environ.get("BASE44_APP_ID", "YOUR_APP_ID_HERE")
 API_KEY = os.environ.get("BASE44_API_KEY", "YOUR_API_KEY_HERE")
-
 BASE44_URL = f"https://preview--matter-track-pro.base44.app/api/apps/{APP_ID}/entities"
+
 DISPLAY_BOARD_URL = "https://livedb9010.digitalls.in/display_board/public/getRecords?skip=0&limit=500"
 SCRAPE_INTERVAL = 30
 THRESHOLDS = [15, 10, 5]
@@ -43,16 +41,19 @@ IST = timezone(timedelta(hours=5, minutes=30))
 CAUSELIST_SUMMARY_URL = "https://livedb9010.digitalls.in/cis_filing/public/getCauseListSummary"
 CAUSELIST_PAGE_URL = "https://new.phhc.gov.in/cause/daily-cause-list"
 CAUSELIST_PDF_URL = "https://new.phhc.gov.in/api/causelist/daily-cause-list-pdf"
-
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# In-memory cache of already-processed (list_date, list_type) pairs
+# Avoids re-checking Base44 on every 30-second cycle
+_cause_list_cache = set()
+_cache_initialized = False
+
 # ============================================================
 # STEP 1 ‚Äî SCRAPE THE DISPLAY BOARD
 # ============================================================
-
 def scrape_display_board():
     """
     Fetches the PHHC display board from the new JSON API.
@@ -121,7 +122,6 @@ def scrape_display_board():
 # ============================================================
 # STEP 2 ‚Äî GET EXISTING COURTSTATUS RECORDS FROM BASE44
 # ============================================================
-
 def get_existing_court_records():
     try:
         response = requests.get(
@@ -146,7 +146,6 @@ def get_existing_court_records():
 # ============================================================
 # STEP 3 ‚Äî WRITE COURT DATA TO BASE44
 # ============================================================
-
 def update_court_status(court_data, existing_records):
     today = datetime.date.today().isoformat()
     now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
@@ -158,7 +157,9 @@ def update_court_status(court_data, existing_records):
             try:
                 r = requests.put(
                     f"{BASE44_URL}/CourtStatus/{record_id}",
-                    headers=HEADERS, json=payload, timeout=15
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=15
                 )
                 if r.status_code != 200:
                     print(f"[WARN] Could not mark court {court_number} inactive: {r.text}")
@@ -183,12 +184,16 @@ def update_court_status(court_data, existing_records):
                 record_id = existing_records[court_number]
                 r = requests.put(
                     f"{BASE44_URL}/CourtStatus/{record_id}",
-                    headers=HEADERS, json=payload, timeout=15
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=15
                 )
             else:
                 r = requests.post(
                     f"{BASE44_URL}/CourtStatus",
-                    headers=HEADERS, json=payload, timeout=15
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=15
                 )
             if r.status_code != 200:
                 print(f"[WARN] Court {court_number} write failed: {r.status_code} {r.text}")
@@ -201,12 +206,12 @@ def update_court_status(court_data, existing_records):
 # ============================================================
 # STEP 4 ‚Äî CHECK TRACKED CASES AND LOG NOTIFICATIONS
 # ============================================================
-
 def get_tracked_cases():
     try:
         response = requests.get(
             f"{BASE44_URL}/TrackedCase",
-            headers=HEADERS, timeout=15
+            headers=HEADERS,
+            timeout=15
         )
         response.raise_for_status()
         all_cases = response.json()
@@ -228,7 +233,6 @@ def get_tracked_cases():
 def check_notifications(court_data, existing_records):
     if not court_data:
         return
-
     cases = get_tracked_cases()
     if not cases:
         return
@@ -251,7 +255,8 @@ def check_notifications(court_data, existing_records):
 
         if is_passover and case.get("notify_at_15", True):
             log_notification(
-                user_id=user_id, case_id=case_id,
+                user_id=user_id,
+                case_id=case_id,
                 notification_type="passover_alert",
                 message=(f"Court {court_number} is in Passover Mode. "
                          f"Your case (Item {item_number}) may be called soon. "
@@ -261,11 +266,11 @@ def check_notifications(court_data, existing_records):
             continue
 
         items_away = item_number - current_item
-
         if items_away <= 0:
             update_case_status(case_id, "called", now)
             log_notification(
-                user_id=user_id, case_id=case_id,
+                user_id=user_id,
+                case_id=case_id,
                 notification_type="case_called",
                 message=(f"Your case (Item {item_number}) in Court {court_number} "
                          f"is being called or has been called."),
@@ -277,7 +282,8 @@ def check_notifications(court_data, existing_records):
             flag_field = f"notify_at_{threshold}"
             if items_away <= threshold and case.get(flag_field, True):
                 log_notification(
-                    user_id=user_id, case_id=case_id,
+                    user_id=user_id,
+                    case_id=case_id,
                     notification_type=f"{threshold}_away",
                     message=(f"Your case in Court {court_number} is {items_away} items away. "
                              f"Court is currently on Item {current_item}. "
@@ -290,14 +296,18 @@ def check_notifications(court_data, existing_records):
 
 def log_notification(user_id, case_id, notification_type, message, now):
     payload = {
-        "user_id": user_id, "case_id": case_id,
+        "user_id": user_id,
+        "case_id": case_id,
         "notification_type": notification_type,
-        "message": message, "sent_at": now
+        "message": message,
+        "sent_at": now
     }
     try:
         r = requests.post(
             f"{BASE44_URL}/NotificationLog",
-            headers=HEADERS, json=payload, timeout=15
+            headers=HEADERS,
+            json=payload,
+            timeout=15
         )
         if r.status_code == 200:
             print(f"[NOTIFICATION] {notification_type} logged for case {case_id}")
@@ -312,7 +322,9 @@ def mark_notification_sent(case_id, flag_field, now):
     try:
         requests.put(
             f"{BASE44_URL}/TrackedCase/{case_id}",
-            headers=HEADERS, json=payload, timeout=15
+            headers=HEADERS,
+            json=payload,
+            timeout=15
         )
     except requests.RequestException as e:
         print(f"[ERROR] Could not mark notification sent: {e}")
@@ -323,7 +335,9 @@ def update_case_status(case_id, status, now):
     try:
         requests.put(
             f"{BASE44_URL}/TrackedCase/{case_id}",
-            headers=HEADERS, json=payload, timeout=15
+            headers=HEADERS,
+            json=payload,
+            timeout=15
         )
     except requests.RequestException as e:
         print(f"[ERROR] Could not update case status: {e}")
@@ -332,13 +346,13 @@ def update_case_status(case_id, status, now):
 # ============================================================
 # STEP 5 ‚Äî RESET NOTIFICATION FLAGS EACH NEW COURT DAY
 # ============================================================
-
 def reset_daily_flags():
     print("[INFO] Resetting daily notification flags...")
     try:
         response = requests.get(
             f"{BASE44_URL}/TrackedCase",
-            headers=HEADERS, timeout=15
+            headers=HEADERS,
+            timeout=15
         )
         response.raise_for_status()
         cases = response.json()
@@ -346,13 +360,17 @@ def reset_daily_flags():
         for case in cases:
             case_id = case.get("_id") or case.get("id")
             payload = {
-                "notify_at_15": True, "notify_at_10": True,
-                "notify_at_5": True, "status": "pending",
+                "notify_at_15": True,
+                "notify_at_10": True,
+                "notify_at_5": True,
+                "status": "pending",
                 "last_updated": now
             }
             requests.put(
                 f"{BASE44_URL}/TrackedCase/{case_id}",
-                headers=HEADERS, json=payload, timeout=15
+                headers=HEADERS,
+                json=payload,
+                timeout=15
             )
         print(f"[INFO] Reset {len(cases)} case flags for new day.")
     except requests.RequestException as e:
@@ -362,22 +380,39 @@ def reset_daily_flags():
 # ============================================================
 # STEP 6 ‚Äî CAUSE LIST SCRAPING
 # ============================================================
-
 def get_csrt_token():
-    """Obtain a fresh csrt token from the PHHC cause list page."""
+    """Obtain a fresh csrt token from the PHHC cause list page using cloudscraper
+    to bypass Cloudflare anti-bot protection."""
     try:
-        session = requests.Session()
-        resp = session.get(CAUSELIST_PAGE_URL, headers=BROWSER_HEADERS, timeout=30)
+        # cloudscraper handles Cloudflare JavaScript challenges automatically
+        session = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'darwin',
+                'desktop': True
+            }
+        )
+        resp = session.get(CAUSELIST_PAGE_URL, headers=BROWSER_HEADERS, timeout=60)
         resp.raise_for_status()
-        match = re.search(r'<input[^>]+name=["\']csrt["\'][^>]+value=["\']([^"\']+)["\']', resp.text)
+
+        # Search for csrt token in hidden input
+        match = re.search(
+            r'<input[^>]+name=["\']csrt["\'][^>]+value=["\']([^"\']+)["\']',
+            resp.text
+        )
         if not match:
-            match = re.search(r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']csrt["\']', resp.text)
+            match = re.search(
+                r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']csrt["\']',
+                resp.text
+            )
+
         if match:
             csrt = match.group(1)
             print(f"[CAUSELIST] Got csrt token: {csrt[:10]}...")
             return session, csrt
         else:
             print("[CAUSELIST] ERROR: csrt token not found in page HTML")
+            print(f"[CAUSELIST] Page preview: {resp.text[:300]}")
             return None, None
     except Exception as e:
         print(f"[CAUSELIST] ERROR getting csrt token: {e}")
@@ -385,7 +420,7 @@ def get_csrt_token():
 
 
 def get_cause_list_summary(cl_date):
-    """Fetch cause list summary for a given date."""
+    """Fetch cause list summary for a given date from the PHHC internal API."""
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
@@ -396,7 +431,8 @@ def get_cause_list_summary(cl_date):
         resp = requests.get(
             CAUSELIST_SUMMARY_URL,
             params={"cl_date": cl_date, "skip": 0, "limit": 100},
-            headers=headers, timeout=30,
+            headers=headers,
+            timeout=30,
         )
         if resp.status_code != 200:
             return []
@@ -407,7 +443,7 @@ def get_cause_list_summary(cl_date):
 
 
 def download_cause_list_pdf(session, csrt, cl_date, list_type, main_suppl):
-    """Download a cause list PDF. Returns bytes or None."""
+    """Download a cause list PDF using the authenticated session. Returns bytes or None."""
     date_underscored = cl_date.replace("-", "_")
     params = {
         "cl_date": date_underscored,
@@ -437,14 +473,12 @@ def parse_cause_list_pdf(pdf_bytes, list_date, list_type_name):
     """Parse a cause list PDF and extract all case entries."""
     entries = []
     current_court = None
-
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text:
                     continue
-
                 lines = text.split("\n")
                 for i, raw_line in enumerate(lines):
                     line = raw_line.strip()
@@ -468,7 +502,6 @@ def parse_cause_list_pdf(pdf_bytes, list_date, list_type_name):
                                 entries.append(entry)
     except Exception as e:
         print(f"[CAUSELIST] PDF parse error: {e}")
-
     return entries
 
 
@@ -492,7 +525,6 @@ def parse_entry_line(line, lines, line_idx, item_number, court_number, list_date
         full_case_number = case_match.group(0)
         case_start = case_match.start()
         case_end = case_match.end()
-
         district = remainder[:case_start].strip().rstrip("-").strip()
         parties = remainder[case_end:].strip()
 
@@ -512,7 +544,7 @@ def parse_entry_line(line, lines, line_idx, item_number, court_number, list_date
                 parties += " " + next_line
             j += 1
 
-        # Split case number
+        # Split case number into parts
         parts = full_case_number.split("-")
         case_year = int(parts[-1])
         case_no = int(parts[-2])
@@ -534,27 +566,40 @@ def parse_entry_line(line, lines, line_idx, item_number, court_number, list_date
             "parties": re.sub(r'\s+', ' ', parties).strip()[:500],
             "downloaded_at": now,
         }
-    except Exception as e:
+    except Exception:
         return None
 
 
-def check_existing_cause_list(list_date, list_type):
-    """Check if CauseListEntry records already exist for this date+type."""
+def _load_cause_list_cache():
+    """Load already-processed (list_date, list_type) pairs from Base44 into memory cache."""
+    global _cause_list_cache, _cache_initialized
+    if _cache_initialized:
+        return
     try:
         resp = requests.get(
             f"{BASE44_URL}/CauseListEntry",
             headers=HEADERS,
-            params={"list_date": list_date, "list_type": list_type},
             timeout=15,
         )
         if resp.status_code == 200:
             records = resp.json()
-            if isinstance(records, list) and len(records) > 0:
-                return True
-        return False
+            if isinstance(records, list):
+                for r in records:
+                    ld = r.get("list_date")
+                    lt = r.get("list_type")
+                    if ld and lt:
+                        _cause_list_cache.add((ld, lt))
+                print(f"[CAUSELIST] Loaded {len(_cause_list_cache)} cached (date, type) pairs from Base44")
+        _cache_initialized = True
     except Exception as e:
-        print(f"[CAUSELIST] Check existing error: {e}")
-        return False
+        print(f"[CAUSELIST] Cache load error: {e}")
+
+
+def check_existing_cause_list(list_date, list_type):
+    """Check if CauseListEntry records already exist for this date+type.
+    Uses an in-memory cache to avoid querying Base44 on every 30-second cycle."""
+    _load_cause_list_cache()
+    return (list_date, list_type) in _cause_list_cache
 
 
 def store_cause_list_entries(entries):
@@ -565,7 +610,9 @@ def store_cause_list_entries(entries):
         try:
             r = requests.post(
                 f"{BASE44_URL}/CauseListEntry",
-                headers=HEADERS, json=entry, timeout=15,
+                headers=HEADERS,
+                json=entry,
+                timeout=15,
             )
             if r.status_code == 200:
                 stored += 1
@@ -582,10 +629,18 @@ def store_cause_list_entries(entries):
 
 
 def scrape_cause_lists():
-    """Main cause list scraping function. Checks today through today+3."""
+    """Main cause list scraping function. Checks today through today+3.
+    - Ordinary lists are published 2 days before the hearing date
+    - Urgent lists are published 1 day before the hearing date
+    """
     print("[CAUSELIST] Starting cause list check...")
     now_ist = datetime.datetime.now(IST)
-    dates_to_check = [(now_ist.date() + timedelta(days=d)).isoformat() for d in range(4)]
+
+    # Check today through today+3 to catch all upcoming cause lists
+    dates_to_check = [
+        (now_ist.date() + timedelta(days=d)).isoformat()
+        for d in range(4)
+    ]
 
     session = None
     csrt = None
@@ -605,15 +660,17 @@ def scrape_cause_lists():
                 if main_suppl != "M":
                     continue
 
+                # Check in-memory cache first (avoids redundant Base44 API calls)
                 if check_existing_cause_list(cl_date, list_type_name):
                     print(f"[CAUSELIST] {list_type_name} {cl_date} already stored, skipping")
                     continue
 
+                # Need to download ‚Äî get session/token if not already obtained
                 if session is None or csrt is None:
                     session, csrt = get_csrt_token()
-                    if not csrt:
-                        print("[CAUSELIST] Cannot proceed without csrt token")
-                        return
+                if not csrt:
+                    print("[CAUSELIST] Cannot proceed without csrt token")
+                    return
 
                 lt = "o" if list_type_name == "ORDINARY" else "u"
                 pdf_bytes = download_cause_list_pdf(session, csrt, cl_date, lt, "m")
@@ -627,7 +684,11 @@ def scrape_cause_lists():
 
                 courts = set(e["court_number"] for e in entries)
                 print(f"[CAUSELIST] {list_type_name} {cl_date}: {len(entries)} entries across {len(courts)} courts")
-                store_cause_list_entries(entries)
+
+                stored = store_cause_list_entries(entries)
+                if stored > 0:
+                    # Update in-memory cache so we don't re-process this
+                    _cause_list_cache.add((cl_date, list_type_name))
 
         except Exception as e:
             print(f"[CAUSELIST] Error processing {cl_date}: {e}")
@@ -639,7 +700,6 @@ def scrape_cause_lists():
 # ============================================================
 # MAIN LOOP
 # ============================================================
-
 def main():
     print("=" * 50)
     print("MatterTracker Scraper ‚Äî Starting")
