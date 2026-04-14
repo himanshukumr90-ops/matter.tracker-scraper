@@ -1,5 +1,5 @@
 """
-MatterTracker ‚Äö√Ñ√Æ PHHC Display Board & Cause List Scraper
+MatterTracker ‚Äö√Ñ√∂‚àö√ë‚àö√Ü PHHC Display Board & Cause List Scraper
 ==========================================
 This script runs 24/7 on Railway.app and does the following every 30 seconds:
 1. Scrapes the Punjab & Haryana High Court display board
@@ -33,7 +33,7 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Cause list config ‚Äö√Ñ√Æ uses livedb9010.digitalls.in (no Cloudflare, accessible from Railway)
+# Cause list config ‚Äö√Ñ√∂‚àö√ë‚àö√Ü uses livedb9010.digitalls.in (no Cloudflare, accessible from Railway)
 IST = timezone(timedelta(hours=5, minutes=30))
 LIVEDB_BASE = "https://livedb9010.digitalls.in"
 CAUSELIST_SUMMARY_URL = f"{LIVEDB_BASE}/cis_filing/public/getCauseListSummary"
@@ -72,7 +72,7 @@ _cause_list_cache = set()
 _cache_initialized = False
 
 # ============================================================
-# STEP 1 ‚Äö√Ñ√Æ SCRAPE THE DISPLAY BOARD
+# STEP 1 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü SCRAPE THE DISPLAY BOARD
 # ============================================================
 def scrape_display_board():
     """
@@ -140,7 +140,7 @@ def scrape_display_board():
 
 
 # ============================================================
-# STEP 2 ‚Äö√Ñ√Æ GET EXISTING COURTSTATUS RECORDS FROM BASE44
+# STEP 2 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü GET EXISTING COURTSTATUS RECORDS FROM BASE44
 # ============================================================
 def get_existing_court_records():
     try:
@@ -164,7 +164,7 @@ def get_existing_court_records():
 
 
 # ============================================================
-# STEP 3 ‚Äö√Ñ√Æ WRITE COURT DATA TO BASE44
+# STEP 3 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü WRITE COURT DATA TO BASE44
 # ============================================================
 def update_court_status(court_data, existing_records):
     today = datetime.date.today().isoformat()
@@ -224,7 +224,7 @@ def update_court_status(court_data, existing_records):
 
 
 # ============================================================
-# STEP 4 ‚Äö√Ñ√Æ CHECK TRACKED CASES AND LOG NOTIFICATIONS
+# STEP 4 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü CHECK TRACKED CASES AND LOG NOTIFICATIONS
 # ============================================================
 def get_tracked_cases():
     try:
@@ -364,7 +364,7 @@ def update_case_status(case_id, status, now):
 
 
 # ============================================================
-# STEP 5 ‚Äö√Ñ√Æ RESET NOTIFICATION FLAGS EACH NEW COURT DAY
+# STEP 5 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü RESET NOTIFICATION FLAGS EACH NEW COURT DAY
 # ============================================================
 def reset_daily_flags():
     print("[INFO] Resetting daily notification flags...")
@@ -398,7 +398,7 @@ def reset_daily_flags():
 
 
 # ============================================================
-# STEP 6 ‚Äö√Ñ√Æ CAUSE LIST SCRAPING (JSON API ‚Äö√Ñ√Æ no PDF, no Cloudflare)
+# STEP 6 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü CAUSE LIST SCRAPING (JSON API ‚Äö√Ñ√∂‚àö√ë‚àö√Ü no PDF, no Cloudflare)
 # ============================================================
 
 def _load_cause_list_cache():
@@ -491,13 +491,20 @@ def fetch_cause_list_for_bench(bench_judge_id, date_str):
 def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
     """
     Fetch all cause list entries for a given date by iterating over all benches.
-    Deduplicates by court_no to avoid storing the same court's list twice
-    (division benches have two judges but one court room).
+
+    Division-bench dedup: Division benches have two judges but one court room,
+    so the same court's records come back from both judges. We track which
+    bench first claimed a court and skip records coming from other benches
+    for that same court. Records from the SAME bench (different envelopes
+    like URGENT + DAILY for the same court) are always kept.
 
     Returns a flat list of entry dicts ready to POST to Base44.
     """
     all_entries = []
-    processed_courts = set()
+    # Maps court_no -> bench_id that first claimed that court. Ensures that
+    # within a single bench we keep every envelope (URGENT + DAILY + etc.),
+    # but across different benches we only keep one copy per court.
+    court_owner = {}
     now_ist = datetime.datetime.now(IST).isoformat(timespec='seconds')
 
     for bench_id in bench_ids:
@@ -512,14 +519,20 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
             if court_no is None:
                 continue
 
-            if court_no in processed_courts:
-                continue  # This court was already processed via the other judge of the division bench
-            processed_courts.add(court_no)
+            owner = court_owner.get(court_no)
+            if owner is not None and owner != bench_id:
+                # Another bench (the other judge of a division bench) already
+                # handled this court - skip to avoid duplicates.
+                continue
+            court_owner[court_no] = bench_id
 
             for rec in records:
-                # Skip supplementary entries ‚Äî only store main cause list (main_suppl='M')
-                if rec.get('main_suppl') == 'S':
-                    continue
+                # NOTE: We deliberately do NOT filter on main_suppl here.
+                # Despite the field name, at the record level main_suppl does
+                # NOT mean "main vs supplementary" - most single-bench URGENT
+                # and DAILY records come through with main_suppl='S', and the
+                # old filter was silently dropping ~80% of all cause list
+                # entries (including our test case RSA-1398-2026 in court 11).
 
                 cl_type = rec.get('cl_type', '')
                 list_type_name = CL_TYPE_NAMES.get(cl_type, cl_type)
@@ -540,7 +553,7 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                 else:
                     parties = ''
 
-                # Extract clean item number ‚Äî sr_no can be "210 **", "101 ***", etc.
+                # Extract clean item number - sr_no can be "210 **", "101 ***", etc.
                 sr_raw = str(rec.get('sr_no') or '')
                 sr_match = re.search(r'\d+', sr_raw)
                 item_number = sr_match.group() if sr_match else sr_raw
@@ -555,7 +568,7 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                     'list_date': date_str,
                     'list_type': list_type_name,
                     'bench_type': str(rec.get('bench_type') or ''),  # 'D'=division, 'S'=single
-                    'district': str(rec.get('main_suppl') or ''),   # 'M'=main, 'S'=supplementary
+                    'district': '',  # not available in cause list API records
                     'parties': parties[:500],
                     'downloaded_at': now_ist,
                 }
@@ -615,7 +628,7 @@ def store_cause_list_entries(entries):
 
 def scrape_cause_lists():
     """
-    Main cause list function. Uses direct JSON API on livedb9010.digitalls.in ‚Äö√Ñ√Æ
+    Main cause list function. Uses direct JSON API on livedb9010.digitalls.in ‚Äö√Ñ√∂‚àö√ë‚àö√Ü
     no PDF download, no csrt token, no Cloudflare.
 
     Checks today+0 through today+3 for available cause lists.
@@ -668,7 +681,7 @@ def scrape_cause_lists():
                 bench_ids = get_active_bench_ids()
 
             if not bench_ids:
-                print("[CAUSELIST] No bench IDs ‚Äö√Ñ√Æ cannot fetch cause lists")
+                print("[CAUSELIST] No bench IDs ‚Äö√Ñ√∂‚àö√ë‚àö√Ü cannot fetch cause lists")
                 return
 
             # Fetch ALL entries for this date (one pass over all benches)
@@ -705,7 +718,7 @@ def scrape_cause_lists():
 # ============================================================
 def main():
     print("=" * 50)
-    print("MatterTracker Scraper ‚Äö√Ñ√Æ Starting")
+    print("MatterTracker Scraper ‚Äö√Ñ√∂‚àö√ë‚àö√Ü Starting")
     print(f"App ID: {APP_ID[:8]}... (truncated for security)")
     print(f"Scraping every {SCRAPE_INTERVAL} seconds")
     print("=" * 50)
