@@ -66,10 +66,25 @@ CL_TYPE_NAMES = {
     'A': 'PRE LOK ADALAT',
 }
 
-# In-memory cache of already-processed (list_date, list_type) pairs
-# Avoids re-fetching entries we've already stored in Base44
-_cause_list_cache = set()
+# In-memory cache for cause list entries. Built once from Base44 at first
+# access and kept in sync with writes. We track two things:
+#   * _cause_list_counts: count of records per (list_date, list_type).
+#     Used for completeness detection - a (date, type) only counts as
+#     "already stored" when it has at least MIN_CAUSE_LIST_RECORDS entries.
+#     This protects against a prior buggy scraper having stored only a
+#     handful of division-bench-only records, which a simple presence
+#     check would mistake for a complete list.
+#   * _cause_list_keys: set of (date, type, case_number, court_no, item_no)
+#     tuples. Used for per-entry dedup when refetching an incomplete list
+#     so we never POST a duplicate of an entry that's already in Base44.
+_cause_list_counts = {}
+_cause_list_keys = set()
 _cache_initialized = False
+# A (date, type) pair below this record count is treated as incomplete and
+# will be refetched. A normal URGENT or ORDINARY day has hundreds of entries
+# across 60+ court rooms, so 50 is well above the ~10-15 that the old buggy
+# scraper was storing, and well below any real full list.
+MIN_CAUSE_LIST_RECORDS = 50
 
 # ============================================================
 # STEP 1 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü SCRAPE THE DISPLAY BOARD
@@ -402,15 +417,20 @@ def reset_daily_flags():
 # ============================================================
 
 def _load_cause_list_cache():
-    """Load already-processed (list_date, list_type) pairs from Base44 into memory cache."""
-    global _cause_list_cache, _cache_initialized
+    """Load existing CauseListEntry records from Base44 into the in-memory
+    counters and key set. Runs once per process start. We count records per
+    (list_date, list_type) so check_existing_cause_list can detect an
+    incomplete list and trigger a refetch, and we index every record by
+    (date, type, case_number, court_no, item_no) so store_cause_list_entries
+    can skip duplicates during a refetch."""
+    global _cache_initialized
     if _cache_initialized:
         return
     try:
         resp = requests.get(
             f"{BASE44_URL}/CauseListEntry",
             headers=HEADERS,
-            timeout=15,
+            timeout=30,
         )
         if resp.status_code == 200:
             records = resp.json()
@@ -418,18 +438,31 @@ def _load_cause_list_cache():
                 for r in records:
                     ld = r.get("list_date")
                     lt = r.get("list_type")
-                    if ld and lt:
-                        _cause_list_cache.add((ld, lt))
-                print(f"[CAUSELIST] Loaded cache: {len(_cause_list_cache)} (date, type) pairs from Base44")
+                    if not (ld and lt):
+                        continue
+                    _cause_list_counts[(ld, lt)] = _cause_list_counts.get((ld, lt), 0) + 1
+                    key = (
+                        ld,
+                        lt,
+                        r.get("case_number") or "",
+                        r.get("court_number"),
+                        str(r.get("item_number") or ""),
+                    )
+                    _cause_list_keys.add(key)
+                print(f"[CAUSELIST] Loaded cache: {len(records)} records across "
+                      f"{len(_cause_list_counts)} (date, type) pairs from Base44")
         _cache_initialized = True
     except Exception as e:
         print(f"[CAUSELIST] Cache load error: {e}")
 
 
 def check_existing_cause_list(list_date, list_type):
-    """Check in-memory cache whether this (date, list_type) has already been stored."""
+    """Return True only if Base44 already holds a COMPLETE (enough) set of
+    entries for this (date, type). 'Complete enough' means at least
+    MIN_CAUSE_LIST_RECORDS records. This prevents a partially-populated
+    list left behind by an earlier buggy run from blocking a fresh pull."""
     _load_cause_list_cache()
-    return (list_date, list_type) in _cause_list_cache
+    return _cause_list_counts.get((list_date, list_type), 0) >= MIN_CAUSE_LIST_RECORDS
 
 
 def get_cause_list_summary(cl_date):
@@ -596,15 +629,34 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                     parent_entry['case_year'] = p_year
                     all_entries.append(parent_entry)
 
-    print(f"[CAUSELIST] Fetched {len(all_entries)} entries across {len(processed_courts)} courts for {date_str}")
+    print(f"[CAUSELIST] Fetched {len(all_entries)} entries across {len(court_owner)} courts for {date_str}")
     return all_entries
 
 
 def store_cause_list_entries(entries):
-    """Write parsed entries to Base44 CauseListEntry entity."""
+    """Write parsed entries to Base44 CauseListEntry entity.
+
+    Skips any entry whose (date, type, case_number, court_no, item_no)
+    key is already in the in-memory index - so a refetch against a
+    partially-populated (date, type) pair never creates duplicates.
+    Successful writes are added to the index and the per-pair counter
+    so subsequent check_existing_cause_list() calls see the fresh state.
+    """
+    _load_cause_list_cache()
     stored = 0
     failed = 0
+    skipped = 0
     for entry in entries:
+        key = (
+            entry.get("list_date"),
+            entry.get("list_type"),
+            entry.get("case_number") or "",
+            entry.get("court_number"),
+            str(entry.get("item_number") or ""),
+        )
+        if key in _cause_list_keys:
+            skipped += 1
+            continue
         try:
             r = requests.post(
                 f"{BASE44_URL}/CauseListEntry",
@@ -614,6 +666,9 @@ def store_cause_list_entries(entries):
             )
             if r.status_code == 200:
                 stored += 1
+                _cause_list_keys.add(key)
+                pair = (entry.get("list_date"), entry.get("list_type"))
+                _cause_list_counts[pair] = _cause_list_counts.get(pair, 0) + 1
             else:
                 failed += 1
                 if failed <= 3:
@@ -622,7 +677,7 @@ def store_cause_list_entries(entries):
             failed += 1
             if failed <= 3:
                 print(f"[CAUSELIST] Store error: {e}")
-    print(f"[CAUSELIST] Stored {stored} entries, {failed} failures")
+    print(f"[CAUSELIST] Stored {stored} entries, skipped {skipped} dupes, {failed} failures")
     return stored
 
 
@@ -702,9 +757,12 @@ def scrape_cause_lists():
                 print(f"[CAUSELIST] {lt} {cl_date}: {len(entries_for_type)} entries across {len(courts)} courts")
 
                 stored = store_cause_list_entries(entries_for_type)
+                # store_cause_list_entries updates _cause_list_counts and
+                # _cause_list_keys on every successful POST, so no separate
+                # cache-add step is needed here.
                 if stored > 0:
-                    _cause_list_cache.add((cl_date, lt))
-                    print(f"[CAUSELIST] Cached ({cl_date}, {lt})")
+                    total = _cause_list_counts.get((cl_date, lt), 0)
+                    print(f"[CAUSELIST] Cached ({cl_date}, {lt}) -> {total} total records")
 
         except Exception as e:
             print(f"[CAUSELIST] Error processing {cl_date}: {e}")
