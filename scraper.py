@@ -571,9 +571,13 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                 list_type_name = CL_TYPE_NAMES.get(cl_type, cl_type)
 
                 case_type = str(rec.get('case_type') or '')
-                case_no = str(rec.get('case_no') or '')
+                case_no_raw = str(rec.get('case_no') or '')
                 case_year = str(rec.get('case_year') or '')
-                case_number = f"{case_type}-{case_no}-{case_year}"
+                case_number = f"{case_type}-{case_no_raw}-{case_year}"
+                try:
+                    case_no = int(case_no_raw)
+                except (ValueError, TypeError):
+                    case_no = None
 
                 pet = (rec.get('pet_name') or '')[:200]
                 res = (rec.get('res_name') or '')[:200]
@@ -615,17 +619,21 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                     if conn.get('prefix') != 'IN':
                         continue
                     p_type = str(conn.get('scase_type') or '').strip()
-                    p_no = str(conn.get('scase_no') or '').strip()
+                    p_no_raw = str(conn.get('scase_no') or '').strip()
                     p_year = str(conn.get('scase_year') or '').strip()
-                    if not p_type or not p_no:
+                    if not p_type or not p_no_raw:
                         continue
-                    parent_cn = f"{p_type}-{p_no}-{p_year}"
+                    parent_cn = f"{p_type}-{p_no_raw}-{p_year}"
                     if parent_cn == case_number:
                         continue
+                    try:
+                        p_no_int = int(p_no_raw)
+                    except (ValueError, TypeError):
+                        p_no_int = None
                     parent_entry = dict(entry)
                     parent_entry['case_number'] = parent_cn
                     parent_entry['case_type'] = p_type
-                    parent_entry['case_no'] = p_no
+                    parent_entry['case_no'] = p_no_int
                     parent_entry['case_year'] = p_year
                     all_entries.append(parent_entry)
 
@@ -669,6 +677,7 @@ def store_cause_list_entries(entries):
                 _cause_list_keys.add(key)
                 pair = (entry.get("list_date"), entry.get("list_type"))
                 _cause_list_counts[pair] = _cause_list_counts.get(pair, 0) + 1
+                time.sleep(0.2)  # avoid Base44 rate limit (429)
             else:
                 failed += 1
                 if failed <= 3:
