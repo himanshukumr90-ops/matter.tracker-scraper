@@ -781,6 +781,153 @@ def scrape_cause_lists():
 
 
 # ============================================================
+# STEP 7 — SYNC TRACKED CASES FROM CAUSE LIST
+# ============================================================
+# Tracks when we last ran the sync so we don't hammer the API every 30s.
+_last_sync_time = None
+SYNC_INTERVAL_SECONDS = 600  # run at most once every 10 minutes
+
+
+def sync_tracked_cases_from_cause_list():
+    """
+    After cause list entries are in Base44, find every TrackedCase whose
+    case appears in an upcoming CauseListEntry and update it with:
+        case_date    → the actual hearing date (so MyCases calendar shows
+                        it on the right day, not on the day it was added)
+        court_number → the court room it's listed in
+        item_number  → its item/SR number on the cause list
+
+    Matching logic:
+        TrackedCase stores case_type="CRM", case_number="39427", case_year=2025.
+        CauseListEntry stores case_number="CRM-39427-2025".
+        We build the composite key from TrackedCase to match.
+
+    We pick the EARLIEST upcoming date if a case appears on multiple days.
+    Rate-limited: only called once every SYNC_INTERVAL_SECONDS.
+    """
+    print("[SYNC] Syncing TrackedCase hearing dates from CauseListEntry...")
+    try:
+        # --- 1. Fetch all TrackedCase records ---
+        resp = requests.get(f"{BASE44_URL}/TrackedCase", headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            print(f"[SYNC] Could not fetch TrackedCase: {resp.status_code}")
+            return
+        all_cases = resp.json()
+        if not all_cases:
+            print("[SYNC] No TrackedCase records found.")
+            return
+
+        # Build composite → TrackedCase map
+        # (composite = "CRM-39427-2025" built from separate fields)
+        case_map = {}
+        for tc in all_cases:
+            ct = str(tc.get("case_type") or "").strip()
+            cn = str(tc.get("case_number") or "").strip()
+            cy = str(tc.get("case_year") or "").strip()
+            if ct and cn and cy:
+                composite = f"{ct}-{cn}-{cy}"
+                # If a user added the same case twice, keep only one entry
+                if composite not in case_map:
+                    case_map[composite] = tc
+
+        if not case_map:
+            print("[SYNC] No valid TrackedCase composites to match.")
+            return
+
+        print(f"[SYNC] Looking for listings for {len(case_map)} unique tracked cases...")
+
+        # --- 2. Check today + next 13 days of cause list entries ---
+        now_ist = datetime.datetime.now(IST)
+        today = now_ist.date().isoformat()
+        dates_to_check = [
+            (now_ist.date() + timedelta(days=d)).isoformat()
+            for d in range(14)
+        ]
+
+        # earliest_match[composite] = { date, court_number, item_number }
+        earliest_match = {}
+
+        for date_str in dates_to_check:
+            resp = requests.get(
+                f"{BASE44_URL}/CauseListEntry",
+                params={"list_date": date_str},
+                headers=HEADERS,
+                timeout=15
+            )
+            if resp.status_code != 200:
+                continue
+            entries = resp.json()
+            if not isinstance(entries, list) or not entries:
+                continue
+
+            for entry in entries:
+                cn = entry.get("case_number")
+                if not cn or cn not in case_map:
+                    continue
+                # Only record the EARLIEST date (dates_to_check is ascending)
+                if cn not in earliest_match:
+                    earliest_match[cn] = {
+                        "date": date_str,
+                        "court_number": entry.get("court_number"),
+                        "item_number": entry.get("item_number"),
+                    }
+
+        if not earliest_match:
+            print("[SYNC] No CauseListEntry matches found for any tracked case.")
+            return
+
+        # --- 3. Update matched TrackedCase records ---
+        now_utc = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        updated = 0
+        for composite, match in earliest_match.items():
+            tc = case_map[composite]
+            tc_id = tc.get("_id") or tc.get("id")
+            new_date = match["date"]
+            new_court = match["court_number"]
+            new_item = match["item_number"]
+
+            # Skip if nothing has changed
+            if (tc.get("case_date") == new_date and
+                    tc.get("court_number") == new_court and
+                    str(tc.get("item_number") or "") == str(new_item or "")):
+                continue
+
+            payload = {
+                "case_date": new_date,
+                "court_number": new_court,
+                "item_number": new_item,
+                "last_updated": now_utc,
+            }
+            r = requests.put(
+                f"{BASE44_URL}/TrackedCase/{tc_id}",
+                headers=HEADERS,
+                json=payload,
+                timeout=15
+            )
+            if r.status_code == 200:
+                updated += 1
+                print(f"[SYNC] {composite} → date={new_date}, "
+                      f"court={new_court}, item={new_item}")
+            else:
+                print(f"[SYNC] Failed to update {composite}: {r.status_code} {r.text[:100]}")
+
+        print(f"[SYNC] Done — updated {updated} / {len(earliest_match)} matched cases.")
+
+    except Exception as e:
+        print(f"[SYNC] Error: {e}")
+
+
+def maybe_sync_tracked_cases():
+    """Rate-limited wrapper — runs sync at most once every SYNC_INTERVAL_SECONDS."""
+    global _last_sync_time
+    now = time.time()
+    if _last_sync_time is not None and (now - _last_sync_time) < SYNC_INTERVAL_SECONDS:
+        return
+    sync_tracked_cases_from_cause_list()
+    _last_sync_time = now
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 def main():
@@ -816,6 +963,12 @@ def main():
                 scrape_cause_lists()
             except Exception as e:
                 print(f"[CAUSELIST] Unexpected error: {e}")
+
+            # --- SYNC TRACKED CASE DATES FROM CAUSE LIST (rate-limited) ---
+            try:
+                maybe_sync_tracked_cases()
+            except Exception as e:
+                print(f"[SYNC] Unexpected error: {e}")
 
             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Cycle complete. "
                   f"Waiting {SCRAPE_INTERVAL}s...")
