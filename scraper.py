@@ -500,25 +500,38 @@ def fetch_cause_list_for_bench(bench_judge_id, date_str):
     """
     Fetch cause list JSON for a specific bench on a given date.
     Returns a list of bench-section dicts (each has 'header' and 'records').
+
+    Retries on HTTP 429 (rate limit) with exponential backoff so that we don't
+    silently drop entire benches when PHHC throttles us partway through the
+    64-bench sweep.
     """
-    try:
-        resp = requests.get(
-            CAUSELIST_ENTRIES_URL,
-            params={
-                'cause_list_date': date_str,
-                'bench_judge_id': bench_judge_id,
-                'skip': 0,
-                'limit': 1000
-            },
-            headers=LIVEDB_HEADERS,
-            timeout=30
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        return []
-    except Exception as e:
-        print(f"[CAUSELIST] Bench {bench_judge_id} {date_str} error: {e}")
-        return []
+    for attempt in range(5):
+        try:
+            resp = requests.get(
+                CAUSELIST_ENTRIES_URL,
+                params={
+                    'cause_list_date': date_str,
+                    'bench_judge_id': bench_judge_id,
+                    'skip': 0,
+                    'limit': 2000
+                },
+                headers=LIVEDB_HEADERS,
+                timeout=30
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 429:
+                wait = 2 + attempt * 2
+                print(f"[CAUSELIST] Bench {bench_judge_id} rate-limited (429), retry in {wait}s (attempt {attempt+1}/5)")
+                time.sleep(wait)
+                continue
+            print(f"[CAUSELIST] Bench {bench_judge_id} HTTP {resp.status_code}")
+            return []
+        except Exception as e:
+            print(f"[CAUSELIST] Bench {bench_judge_id} {date_str} error: {e} (attempt {attempt+1}/5)")
+            time.sleep(1 + attempt)
+    print(f"[CAUSELIST] Bench {bench_judge_id} giving up after retries")
+    return []
 
 
 def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
@@ -540,8 +553,13 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
     court_owner = {}
     now_ist = datetime.datetime.now(IST).isoformat(timespec='seconds')
 
-    for bench_id in bench_ids:
+    for idx, bench_id in enumerate(bench_ids):
         bench_sections = fetch_cause_list_for_bench(bench_id, date_str)
+        # Throttle inter-bench requests to stay under PHHC rate limits.
+        # Without this the server 429s partway through and we silently lose
+        # entire benches of records (confirmed on 2026-04-23).
+        if idx < len(bench_ids) - 1:
+            time.sleep(0.7)
         for section in bench_sections:
             records = section.get('records', [])
             if not records:
