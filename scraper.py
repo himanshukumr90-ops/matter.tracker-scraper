@@ -946,6 +946,194 @@ def maybe_sync_tracked_cases():
 
 
 # ============================================================
+# STEP 8 — PERIODIC WEBSITE REFRESH OF TRACKED CASES
+# ============================================================
+# Re-fetches case details from the PHHC lookup API (Vercel) for every
+# TrackedCase and updates case_date/next_hearing_date when PHHC has
+# posted a new date. Cause-list sync runs right after this in the main
+# loop, so if a case is on a published cause list that value will still
+# overwrite whatever came from the website — cause list trumps website.
+_last_website_refresh_time = None
+WEBSITE_REFRESH_INTERVAL_SECONDS = 6 * 3600  # every 6 hours
+CASE_LOOKUP_API = "https://mattertracker-api.vercel.app/case"
+
+
+def _parse_phhc_date(raw):
+    """
+    Parse a date string coming back from the PHHC lookup API into a
+    YYYY-MM-DD string, or return None if it can't be parsed / is empty.
+    Accepts YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, 'D Mon YYYY', etc.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    fmts = [
+        "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y",
+        "%d %b %Y", "%d %B %Y",
+        "%d-%b-%Y", "%d-%B-%Y",
+    ]
+    for f in fmts:
+        try:
+            return datetime.datetime.strptime(s, f).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _pick_future_date(*candidates):
+    """
+    From a list of raw date strings, return the EARLIEST parsed date
+    that is today or in the future, as YYYY-MM-DD, or None.
+    """
+    today = datetime.datetime.now(IST).date()
+    parsed = []
+    for c in candidates:
+        d = _parse_phhc_date(c)
+        if not d:
+            continue
+        try:
+            dt = datetime.date.fromisoformat(d)
+        except ValueError:
+            continue
+        if dt >= today:
+            parsed.append(d)
+    if not parsed:
+        return None
+    return min(parsed)
+
+
+def refresh_tracked_cases_from_website():
+    """
+    Walk every TrackedCase and re-fetch case details from the PHHC lookup
+    API. Update case_date when PHHC has a newer/future hearing date.
+
+    Conflict rule: website values are a best-guess starting point. The
+    cause-list sync runs immediately after this in the main loop and
+    will overwrite case_date with the actual cause-list date when a
+    match exists, so cause list always takes precedence.
+    """
+    print("[WEBREFRESH] Refreshing tracked case details from PHHC website...")
+    try:
+        resp = requests.get(f"{BASE44_URL}/TrackedCase", headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            print(f"[WEBREFRESH] Could not fetch TrackedCase: {resp.status_code}")
+            return
+        all_cases = resp.json()
+        if not all_cases:
+            print("[WEBREFRESH] No TrackedCase records found.")
+            return
+
+        now_utc = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        today = datetime.datetime.now(IST).date()
+        updated = 0
+        checked = 0
+
+        for tc in all_cases:
+            ct = str(tc.get("case_type") or "").strip()
+            cn = str(tc.get("case_number") or "").strip()
+            cy = str(tc.get("case_year") or "").strip()
+            if not (ct and cn and cy):
+                continue
+            tc_id = tc.get("_id") or tc.get("id")
+            if not tc_id:
+                continue
+
+            # Throttle the Vercel API
+            time.sleep(0.3)
+            checked += 1
+            try:
+                r = requests.get(
+                    CASE_LOOKUP_API,
+                    params={"type": ct, "no": cn, "year": cy},
+                    timeout=20
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+            except Exception as e:
+                print(f"[WEBREFRESH] Lookup failed for {ct}-{cn}-{cy}: {e}")
+                continue
+
+            if not data.get("found"):
+                continue
+
+            new_date = _pick_future_date(
+                data.get("next_hearing_date"),
+                data.get("listing_date"),
+            )
+
+            payload = {}
+
+            # Only update case_date if
+            #   (a) we have a future/today date from PHHC, AND
+            #   (b) the current case_date is empty, in the past, or
+            #       different from the PHHC-derived date.
+            # If current case_date is today-or-future AND came from the
+            # cause list sync, that sync will just overwrite our value
+            # on its next run anyway, so this is safe.
+            current_date = tc.get("case_date")
+            if new_date:
+                should_update = False
+                if not current_date:
+                    should_update = True
+                else:
+                    try:
+                        cur_dt = datetime.date.fromisoformat(current_date)
+                        if cur_dt < today or current_date != new_date:
+                            should_update = True
+                    except ValueError:
+                        should_update = True
+                if should_update:
+                    payload["case_date"] = new_date
+
+            # Keep next_hearing_date raw field in sync with API (if API
+            # populates it). Never clobber an existing non-empty value
+            # with an empty one — PHHC sometimes blanks this between
+            # refreshes.
+            api_nhd = _parse_phhc_date(data.get("next_hearing_date"))
+            if api_nhd and api_nhd != tc.get("next_hearing_date"):
+                payload["next_hearing_date"] = api_nhd
+
+            if not payload:
+                continue
+
+            payload["last_updated"] = now_utc
+            try:
+                u = requests.put(
+                    f"{BASE44_URL}/TrackedCase/{tc_id}",
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=15
+                )
+                if u.status_code == 200:
+                    updated += 1
+                    print(f"[WEBREFRESH] {ct}-{cn}-{cy} → {payload}")
+                else:
+                    print(f"[WEBREFRESH] Update failed for {ct}-{cn}-{cy}: "
+                          f"{u.status_code} {u.text[:100]}")
+            except Exception as e:
+                print(f"[WEBREFRESH] Update error for {ct}-{cn}-{cy}: {e}")
+
+        print(f"[WEBREFRESH] Done — checked {checked}, updated {updated}.")
+
+    except Exception as e:
+        print(f"[WEBREFRESH] Error: {e}")
+
+
+def maybe_refresh_tracked_cases_from_website():
+    """Rate-limited: runs at most once every WEBSITE_REFRESH_INTERVAL_SECONDS."""
+    global _last_website_refresh_time
+    now = time.time()
+    if (_last_website_refresh_time is not None
+            and (now - _last_website_refresh_time) < WEBSITE_REFRESH_INTERVAL_SECONDS):
+        return
+    refresh_tracked_cases_from_website()
+    _last_website_refresh_time = now
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 def main():
@@ -981,6 +1169,15 @@ def main():
                 scrape_cause_lists()
             except Exception as e:
                 print(f"[CAUSELIST] Unexpected error: {e}")
+
+            # --- REFRESH TRACKED CASE DETAILS FROM PHHC WEBSITE (rate-limited, ~6h) ---
+            # Runs BEFORE cause-list sync so that if both fire in the same
+            # cycle, the cause-list sync gets the last word (cause list trumps
+            # website).
+            try:
+                maybe_refresh_tracked_cases_from_website()
+            except Exception as e:
+                print(f"[WEBREFRESH] Unexpected error: {e}")
 
             # --- SYNC TRACKED CASE DATES FROM CAUSE LIST (rate-limited) ---
             try:
