@@ -64,6 +64,12 @@ CL_TYPE_NAMES = {
     'M': 'MEDIATION DRIVE',
     'R': 'REGULAR',
     'A': 'PRE LOK ADALAT',
+    # 'B' is used only by the OLD highcourtchd.gov.in site (the "Complete
+    # List" published overnight). Our livedb-path scraper never produces
+    # this code; it's emitted only by scrape_complete_lists() below. It
+    # maps to list_type 'COMPLETE' which the sync function prioritises
+    # above ORDINARY and URGENT.
+    'B': 'COMPLETE',
 }
 
 # In-memory cache for cause list entries. Built once from Base44 at first
@@ -878,10 +884,23 @@ def sync_tracked_cases_from_cause_list():
             if not isinstance(entries, list) or not entries:
                 continue
 
+            # Within this date, pick the single BEST entry per tracked
+            # case by list-type priority: COMPLETE > ORDINARY > URGENT.
+            # Complete List (from the old highcourtchd.gov.in site) is the
+            # final, authoritative list published overnight before hearing;
+            # it trumps Ordinary and Urgent whenever it's present.
+            LIST_TYPE_PRIORITY = {"COMPLETE": 0, "ORDINARY": 1, "URGENT": 2}
+            best_per_case = {}  # cn -> (priority, entry)
             for entry in entries:
                 cn = entry.get("case_number")
                 if not cn or cn not in case_map:
                     continue
+                p = LIST_TYPE_PRIORITY.get(entry.get("list_type"), 99)
+                cur = best_per_case.get(cn)
+                if cur is None or p < cur[0]:
+                    best_per_case[cn] = (p, entry)
+
+            for cn, (_, entry) in best_per_case.items():
                 # Only record the EARLIEST date (dates_to_check is ascending)
                 if cn not in earliest_match:
                     earliest_match[cn] = {
@@ -1134,6 +1153,262 @@ def maybe_refresh_tracked_cases_from_website():
 
 
 # ============================================================
+# STEP 9 — COMPLETE LIST (from old highcourtchd.gov.in site)
+# ============================================================
+# The old site publishes the Complete List as a PDF ~10pm-12am the
+# night before the hearing date. It's the final, authoritative list
+# with court numbers and item numbers for every case (ordinary, urgent,
+# commercial, etc. merged). The sync function prioritises COMPLETE
+# over ORDINARY and URGENT whenever it exists.
+import subprocess
+import tempfile
+
+OLD_SITE_BASE = "https://highcourtchd.gov.in"
+OLD_SITE_FORM_URL = f"{OLD_SITE_BASE}/view_causeList.php"
+OLD_SITE_PDF_URL = f"{OLD_SITE_BASE}/show_cause_list.php"
+# Static CSRF token the site accepts — it's just 'phhc-team' hex-encoded.
+OLD_SITE_CSRF = "706868632d7465616d"
+OLD_SITE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Referer": f"{OLD_SITE_BASE}/?mod=causelist",
+}
+
+COMPLETE_LIST_POLL_INTERVAL_SECONDS = 15 * 60  # every 15 minutes
+MIN_COMPLETE_LIST_RECORDS = 1000  # a real Complete List day has 3k-5k+
+_last_complete_poll = {}  # date_str -> epoch seconds
+# Throttle between old-site HTTP calls — user asked for an extra-patient
+# runner. 3s between requests is friendly and still fast enough.
+OLD_SITE_THROTTLE_SECONDS = 3.0
+_last_old_site_call = 0.0
+
+
+def _old_site_throttle():
+    """Block until at least OLD_SITE_THROTTLE_SECONDS have passed since
+    the last call to the old site. Keeps us polite and well below any
+    rate-limit threshold."""
+    global _last_old_site_call
+    now = time.time()
+    wait = OLD_SITE_THROTTLE_SECONDS - (now - _last_old_site_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_old_site_call = time.time()
+
+
+def download_complete_list_pdf(date_str):
+    """
+    Download the Complete List PDF for a date (YYYY-MM-DD) from
+    highcourtchd.gov.in. Returns the path to a temp PDF file, or None
+    if the PDF isn't published yet / network fails.
+    """
+    try:
+        d = datetime.date.fromisoformat(date_str)
+    except ValueError:
+        return None
+    ddmmyyyy = d.strftime("%d/%m/%Y")
+
+    # --- Step 1: POST to view_causeList.php to get obfuscated filename ---
+    try:
+        _old_site_throttle()
+        r = requests.post(
+            OLD_SITE_FORM_URL,
+            headers={**OLD_SITE_HEADERS, "X-Requested-With": "XMLHttpRequest"},
+            data={
+                "csrf_token": OLD_SITE_CSRF,
+                "t_f_date": ddmmyyyy,
+                "urg_ord": "B",  # B = Complete List
+                "action": "show_causeList",
+            },
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"[COMPLETE] {date_str} form POST failed: {e}")
+        return None
+    if r.status_code != 200:
+        print(f"[COMPLETE] {date_str} form POST HTTP {r.status_code}")
+        return None
+
+    m = re.search(r"filename=([A-Za-z0-9]+)", r.text)
+    if not m:
+        # Either no Complete List published yet for this date, or the
+        # page layout changed.
+        return None
+    obfuscated = m.group(1)
+
+    # --- Step 2: GET the PDF ---
+    try:
+        _old_site_throttle()
+        r = requests.get(
+            OLD_SITE_PDF_URL,
+            params={"filename": obfuscated},
+            headers=OLD_SITE_HEADERS,
+            timeout=120,  # PDFs are ~4MB
+        )
+    except Exception as e:
+        print(f"[COMPLETE] {date_str} PDF GET failed: {e}")
+        return None
+    if r.status_code != 200:
+        print(f"[COMPLETE] {date_str} PDF GET HTTP {r.status_code}")
+        return None
+    if "application/pdf" not in r.headers.get("Content-Type", ""):
+        print(f"[COMPLETE] {date_str} PDF GET got non-PDF content")
+        return None
+
+    # Save to temp file
+    fd, path = tempfile.mkstemp(prefix=f"cl_{date_str}_", suffix=".pdf")
+    with os.fdopen(fd, "wb") as f:
+        f.write(r.content)
+    print(f"[COMPLETE] {date_str} downloaded PDF ({len(r.content) // 1024} KB)")
+    return path
+
+
+# Match a cause-list entry line like:
+#   "  101 I    KAPURTHALA    CRM-18484-2023  ..."
+# Captures: item, column_marker, case_type, case_no, case_year.
+_ENTRY_RE = re.compile(
+    r"^\s*(?P<item>\d{1,4})\s+"
+    r"(?P<col>[IVX\*]+)\s+"
+    r"(?P<rest>.{0,60}?)\s+"
+    r"(?P<ct>[A-Z]+(?:-[A-Z]+)*)-(?P<no>\d+)-(?P<yr>\d{4})\b"
+)
+# Detect the court-room number from section headers like:
+#   "... CR NO 31" or zoom link "vcphhc31"
+_CR_NO_RE = re.compile(r"\bCR\s+NO\s+(\d+)\b")
+_VC_LINK_RE = re.compile(r"vcphhc(\d{2,3})")
+
+
+def parse_complete_list_pdf(pdf_path, date_str):
+    """
+    Parse the Complete List PDF using `pdftotext -layout`. Returns a
+    list of CauseListEntry dicts (same shape as the livedb path).
+    """
+    try:
+        txt = subprocess.run(
+            ["pdftotext", "-layout", pdf_path, "-"],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        ).stdout.decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        print("[COMPLETE] pdftotext not installed — skipping parse")
+        return []
+    except Exception as e:
+        print(f"[COMPLETE] pdftotext failed: {e}")
+        return []
+
+    entries = []
+    seen_keys = set()  # (case_number, court_no, item) dedup within the PDF
+    current_court = None
+    now_ist = datetime.datetime.now(IST).isoformat(timespec='seconds')
+
+    for line in txt.splitlines():
+        # Track current court room from section headers
+        m_cr = _CR_NO_RE.search(line)
+        if m_cr:
+            try:
+                current_court = int(m_cr.group(1))
+            except ValueError:
+                pass
+            continue
+        m_vc = _VC_LINK_RE.search(line)
+        if m_vc:
+            try:
+                current_court = int(m_vc.group(1))
+            except ValueError:
+                pass
+            # Don't `continue` — vc link might appear on a line that
+            # doesn't also have an entry, but doesn't hurt to try.
+
+        m = _ENTRY_RE.match(line)
+        if not m or current_court is None:
+            continue
+
+        item_raw = m.group("item")
+        case_type = m.group("ct")
+        case_no_raw = m.group("no")
+        case_year = m.group("yr")
+        case_number = f"{case_type}-{case_no_raw}-{case_year}"
+
+        # Dedup — the same case can appear multiple times in the PDF
+        # (e.g. linked with sub-applications). We keep the first seen.
+        key = (case_number, current_court, item_raw)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        try:
+            case_no_int = int(case_no_raw)
+        except ValueError:
+            case_no_int = None
+
+        entries.append({
+            "case_number": case_number,
+            "case_type": case_type,
+            "case_no": case_no_int,
+            "case_year": case_year,
+            "court_number": current_court,
+            "item_number": item_raw,
+            "list_date": date_str,
+            "list_type": "COMPLETE",
+            "bench_type": "",
+            "district": "",
+            "parties": "",
+            "last_updated": now_ist,
+        })
+
+    print(f"[COMPLETE] {date_str} parsed {len(entries)} entries from PDF")
+    return entries
+
+
+def scrape_complete_lists():
+    """
+    For each upcoming date (today..today+3), attempt to download and
+    parse the Complete List PDF from the old site. Skips dates that
+    already have a stored Complete list in Base44 (>= MIN_COMPLETE_LIST_RECORDS).
+    Rate-limited: at most one poll per (date) per
+    COMPLETE_LIST_POLL_INTERVAL_SECONDS.
+    """
+    global _last_complete_poll
+    now_ist = datetime.datetime.now(IST)
+    dates_to_check = [
+        (now_ist.date() + timedelta(days=d)).isoformat()
+        for d in range(4)
+    ]
+    now_epoch = time.time()
+
+    for cl_date in dates_to_check:
+        # Already have a complete enough Complete List?
+        if _cause_list_counts.get((cl_date, "COMPLETE"), 0) >= MIN_COMPLETE_LIST_RECORDS:
+            continue
+        # Polled too recently?
+        last = _last_complete_poll.get(cl_date)
+        if last is not None and (now_epoch - last) < COMPLETE_LIST_POLL_INTERVAL_SECONDS:
+            continue
+        _last_complete_poll[cl_date] = now_epoch
+
+        print(f"[COMPLETE] {cl_date}: checking old site for Complete List...")
+        pdf_path = download_complete_list_pdf(cl_date)
+        if not pdf_path:
+            print(f"[COMPLETE] {cl_date}: Complete List not yet published (or fetch failed)")
+            continue
+
+        try:
+            entries = parse_complete_list_pdf(pdf_path, cl_date)
+        finally:
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+
+        if not entries:
+            print(f"[COMPLETE] {cl_date}: no parseable entries")
+            continue
+
+        store_cause_list_entries(entries)
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 def main():
@@ -1169,6 +1444,12 @@ def main():
                 scrape_cause_lists()
             except Exception as e:
                 print(f"[CAUSELIST] Unexpected error: {e}")
+
+            # --- SCRAPE COMPLETE LIST from old PHHC site (rate-limited, ~15min per date) ---
+            try:
+                scrape_complete_lists()
+            except Exception as e:
+                print(f"[COMPLETE] Unexpected error: {e}")
 
             # --- REFRESH TRACKED CASE DETAILS FROM PHHC WEBSITE (rate-limited, ~6h) ---
             # Runs BEFORE cause-list sync so that if both fire in the same
