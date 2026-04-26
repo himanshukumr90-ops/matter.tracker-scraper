@@ -87,10 +87,17 @@ _cause_list_counts = {}
 _cause_list_keys = set()
 _cache_initialized = False
 # A (date, type) pair below this record count is treated as incomplete and
-# will be refetched. A normal URGENT or ORDINARY day has hundreds of entries
-# across 60+ court rooms, so 50 is well above the ~10-15 that the old buggy
-# scraper was storing, and well below any real full list.
-MIN_CAUSE_LIST_RECORDS = 50
+# will be refetched.
+#
+# Threshold rationale (updated 2026-04-26):
+#   A full ORDINARY list has 3,500-4,700 entries across 50-64 courts.
+#   The old pre-429-fix scraper would hit rate limits after a handful of
+#   benches, storing only 50-300 records — enough to satisfy the old
+#   threshold of 50, which permanently blocked refetches for those dates.
+#   Raising to 2,000 ensures any partial fetch gets retried while still
+#   sitting comfortably below the minimum realistic full-list size.
+#   The dedup key set (_cause_list_keys) prevents actual duplicates on refetch.
+MIN_CAUSE_LIST_RECORDS = 2000
 
 # ============================================================
 # STEP 1 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü SCRAPE THE DISPLAY BOARD
