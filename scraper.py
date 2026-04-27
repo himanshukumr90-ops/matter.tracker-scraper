@@ -640,7 +640,13 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                     'parties': parties[:500],
                     'downloaded_at': now_ist,
                 }
-                all_entries.append(entry)
+                # Base44 schema requires a numeric case_no; rows whose case
+                # number can't be parsed as int (e.g. "12345A") would be
+                # rejected at write time. Skip them here to avoid log spam
+                # and wasted API calls. Connected/parent cases are still
+                # processed below since they have their own case_no.
+                if case_no is not None:
+                    all_entries.append(entry)
 
                 # Parse connected_cases to also store entries for parent cases.
                 # When CM-18870-CWP-2025 is listed "IN CWP-17995-2023", the parent case
@@ -661,6 +667,8 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                         p_no_int = int(p_no_raw)
                     except (ValueError, TypeError):
                         p_no_int = None
+                    if p_no_int is None:
+                        continue  # Same reason as above for parent cases
                     parent_entry = dict(entry)
                     parent_entry['case_number'] = parent_cn
                     parent_entry['case_type'] = p_type
@@ -1349,6 +1357,11 @@ def parse_complete_list_pdf(pdf_path, date_str):
         except ValueError:
             case_no_int = None
 
+        if case_no_int is None:
+            # Base44 schema requires a numeric case_no; skip rows whose
+            # case number can't be parsed as int (e.g. "12345A").
+            continue
+
         entries.append({
             "case_number": case_number,
             "case_type": case_type,
@@ -1361,6 +1374,7 @@ def parse_complete_list_pdf(pdf_path, date_str):
             "bench_type": "",
             "district": "",
             "parties": "",
+            "downloaded_at": now_ist,
             "last_updated": now_ist,
         })
 
