@@ -278,6 +278,93 @@ def get_tracked_cases():
         return []
 
 
+def get_court_queue(court_number, date_str):
+    """
+    Return the ordered list of item_numbers (ints, ascending) that a
+    given court will work through on a given date. Drawn from the
+    in-memory _cause_list_keys cache, so no extra HTTP calls.
+
+    Preference order:
+      1. COMPLETE list (the authoritative night-before PDF, which already
+         interleaves URGENT and ORDINARY in the order the court calls them)
+      2. URGENT + ORDINARY merged + sorted (fallback for dates where the
+         Complete List PDF wasn't published / scraped)
+
+    Returns [] if no list is available.
+    """
+    _load_cause_list_cache()
+
+    def _items_for(list_type):
+        out = set()
+        for (ld, lt, _cn, court_no, item_no) in _cause_list_keys:
+            if ld != date_str or lt != list_type or court_no != court_number:
+                continue
+            try:
+                out.add(int(str(item_no).strip()))
+            except (ValueError, TypeError):
+                continue
+        return sorted(out)
+
+    complete = _items_for("COMPLETE")
+    if complete:
+        return complete
+
+    urgent = _items_for("URGENT")
+    ordinary = _items_for("ORDINARY")
+    if not urgent and not ordinary:
+        return []
+    # Merge by item-number ascending. Court calls urgent items (typically
+    # 100-series) before ordinary (200-series), so the natural numeric sort
+    # already produces the right call order.
+    return sorted(set(urgent) | set(ordinary))
+
+
+def _compute_items_away(queue_cache, court_number, date_str, current_item, user_item):
+    """
+    Items remaining between the court's current_item and the user's case,
+    using the actual list of items the court will call (so the gap between
+    the Urgent block (e.g. 101-150) and the Ordinary block (e.g. 201+) is
+    correctly skipped).
+
+    Returns an integer items_away if the queue is known and the user's item
+    is in it; otherwise returns None so the caller can fall back to naive
+    arithmetic.
+    """
+    if court_number not in queue_cache:
+        queue_cache[court_number] = get_court_queue(court_number, date_str)
+    queue = queue_cache[court_number]
+    if not queue:
+        return None
+
+    try:
+        user_int = int(str(user_item).strip()) if user_item is not None else None
+        current_int = int(str(current_item).strip()) if current_item is not None else 0
+    except (ValueError, TypeError):
+        return None
+
+    if user_int is None or user_int not in queue:
+        return None
+
+    user_pos = queue.index(user_int)
+
+    if current_int <= 0:
+        # Court hasn't started (display board sentinel). User is user_pos
+        # items away from the start.
+        return user_pos
+
+    if current_int in queue:
+        return user_pos - queue.index(current_int)
+
+    # current_int isn't a queue item (e.g. a passover item or off-list
+    # motion). Treat the court's effective position as the largest queue
+    # item less than current_int.
+    smaller = [q for q in queue if q < current_int]
+    if smaller:
+        return user_pos - queue.index(smaller[-1])
+    # Court is at an item below the entire queue → not yet reached.
+    return user_pos
+
+
 def check_notifications(court_data, existing_records):
     if not court_data:
         return
@@ -287,6 +374,7 @@ def check_notifications(court_data, existing_records):
 
     today = datetime.date.today().isoformat()
     now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    queue_cache = {}  # court_number -> sorted [int, ...]; cached per call
 
     for case in cases:
         court_number = case.get("court_number")
@@ -313,7 +401,18 @@ def check_notifications(court_data, existing_records):
             )
             continue
 
-        items_away = item_number - current_item
+        # Prefer queue-aware computation that skips the gap between Urgent
+        # (100s) and Ordinary (200s). Falls back to naive subtraction when
+        # the queue isn't loaded yet (e.g. before the Complete / Urgent /
+        # Ordinary list is published for that date).
+        items_away = _compute_items_away(
+            queue_cache, court_number, today, current_item, item_number
+        )
+        if items_away is None:
+            try:
+                items_away = int(item_number) - int(current_item)
+            except (ValueError, TypeError):
+                continue
         if items_away <= 0:
             update_case_status(case_id, "called", now)
             log_notification(
