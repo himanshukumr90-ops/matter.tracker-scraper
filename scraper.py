@@ -326,7 +326,7 @@ def get_court_queue(court_number, date_str):
             if ld != date_str or lt != list_type or court_no != court_number:
                 continue
             try:
-                out.add(int(str(item_no).strip()))
+                out.add(int(_norm_item_no(item_no)))
             except (ValueError, TypeError):
                 continue
         return sorted(out)
@@ -363,8 +363,8 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
         return None
 
     try:
-        user_int = int(str(user_item).strip()) if user_item is not None else None
-        current_int = int(str(current_item).strip()) if current_item is not None else 0
+        user_int = int(_norm_item_no(user_item)) if user_item is not None else None
+        current_int = int(_norm_item_no(current_item)) if current_item is not None else 0
     except (ValueError, TypeError):
         return None
 
@@ -639,6 +639,31 @@ def reset_daily_flags():
 # STEP 6 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü CAUSE LIST SCRAPING (JSON API ‚Äö√Ñ√∂‚àö√ë‚àö√Ü no PDF, no Cloudflare)
 # ============================================================
 
+def _norm_item_no(v):
+    """Normalise an item number to a canonical digit string.
+
+    Base44 returns numeric fields as FLOATS (item_number 206.0) while the
+    scrapers build STRINGS ("206"); str() of each gives "206.0" vs "206",
+    so dedup keys built from DB rows never matched keys built from fresh
+    scrapes — every container restart re-inserted the whole current
+    window as duplicates (observed 2026-06-11: "Stored 198 entries,
+    skipped 0 dupes" for a fully-stored URGENT list). The same mismatch
+    made int("206.0") raise in get_court_queue, silently emptying the
+    queue for cache-loaded entries. Everything that touches item_number
+    must go through this helper."""
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        try:
+            return str(int(v))
+        except (ValueError, OverflowError):
+            return str(v)
+    s = str(v).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
 def _fetch_cause_list_rows(filter_params):
     """Fetch ALL CauseListEntry rows matching filter_params from Base44,
     paginating with limit/skip. A single unfiltered GET silently caps at
@@ -705,7 +730,7 @@ def _load_cause_list_cache():
                     lt,
                     r.get("case_number") or "",
                     r.get("court_number"),
-                    str(r.get("item_number") or ""),
+                    _norm_item_no(r.get("item_number")),
                 )
                 _cause_list_keys.add(key)
             total += len(records)
@@ -957,7 +982,7 @@ def store_cause_list_entries(entries):
             entry.get("list_type"),
             entry.get("case_number") or "",
             entry.get("court_number"),
-            str(entry.get("item_number") or ""),
+            _norm_item_no(entry.get("item_number")),
         )
         if key in _cause_list_keys:
             skipped += 1
@@ -1212,7 +1237,7 @@ def sync_tracked_cases_from_cause_list():
             # Skip if nothing has changed
             if (tc.get("case_date") == new_date and
                     tc.get("court_number") == new_court and
-                    str(tc.get("item_number") or "") == str(new_item or "")):
+                    _norm_item_no(tc.get("item_number")) == _norm_item_no(new_item)):
                 continue
 
             payload = {
