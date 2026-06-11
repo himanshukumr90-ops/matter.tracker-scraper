@@ -99,6 +99,32 @@ _cache_initialized = False
 #   The dedup key set (_cause_list_keys) prevents actual duplicates on refetch.
 MIN_CAUSE_LIST_RECORDS = 2000
 
+# Sweep-outcome memory (added 2026-06-11). The count threshold above can
+# never be satisfied on small-list days (court vacations in June publish
+# ~66 entries total; Lok Adalat / half days are similar), so the scraper
+# used to re-sweep all ~62 benches every 30s cycle all day, hammering the
+# PHHC API into 429s. We now remember how each sweep of a (date, type)
+# ended:
+#   * clean (no bench lost to 429-give-up or repeated timeouts):
+#       don't re-sweep for CLEAN_SWEEP_REFRESH_SECONDS, regardless of size.
+#   * dirty (one or more benches dropped):
+#       retry after FAILED_SWEEP_RETRY_SECONDS instead of immediately —
+#       the instant retry was itself feeding the rate-limit cascade.
+# Term-time behaviour is unchanged: full lists hit MIN_CAUSE_LIST_RECORDS
+# and are skipped before this gate is ever consulted.
+_sweep_state = {}  # (date_str, list_type) -> {"time": epoch, "clean": bool}
+CLEAN_SWEEP_REFRESH_SECONDS = 6 * 3600
+FAILED_SWEEP_RETRY_SECONDS = 30 * 60
+
+
+def _sweep_allowed(cl_date, list_type, now_epoch):
+    """True if (date, type) is due for a fresh bench sweep."""
+    st = _sweep_state.get((cl_date, list_type))
+    if st is None:
+        return True
+    wait = CLEAN_SWEEP_REFRESH_SECONDS if st["clean"] else FAILED_SWEEP_RETRY_SECONDS
+    return (now_epoch - st["time"]) >= wait
+
 # ============================================================
 # STEP 1 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü SCRAPE THE DISPLAY BOARD
 # ============================================================
@@ -611,7 +637,9 @@ def get_active_bench_ids():
 def fetch_cause_list_for_bench(bench_judge_id, date_str):
     """
     Fetch cause list JSON for a specific bench on a given date.
-    Returns a list of bench-section dicts (each has 'header' and 'records').
+    Returns a list of bench-section dicts (each has 'header' and 'records'),
+    or None when the bench was LOST (gave up after 429/timeout retries) —
+    callers use None vs [] to tell a dirty sweep from an empty bench.
 
     Retries on HTTP 429 (rate limit) with exponential backoff so that we don't
     silently drop entire benches when PHHC throttles us partway through the
@@ -643,7 +671,7 @@ def fetch_cause_list_for_bench(bench_judge_id, date_str):
             print(f"[CAUSELIST] Bench {bench_judge_id} {date_str} error: {e} (attempt {attempt+1}/5)")
             time.sleep(1 + attempt)
     print(f"[CAUSELIST] Bench {bench_judge_id} giving up after retries")
-    return []
+    return None
 
 
 def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
@@ -656,9 +684,13 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
     for that same court. Records from the SAME bench (different envelopes
     like URGENT + DAILY for the same court) are always kept.
 
-    Returns a flat list of entry dicts ready to POST to Base44.
+    Returns (entries, lost_benches): a flat list of entry dicts ready to
+    POST to Base44, plus the number of benches that were dropped after
+    exhausting retries (0 means the sweep was clean and its result can be
+    trusted as the full published list, however small).
     """
     all_entries = []
+    lost_benches = 0
     # Maps court_no -> bench_id that first claimed that court. Ensures that
     # within a single bench we keep every envelope (URGENT + DAILY + etc.),
     # but across different benches we only keep one copy per court.
@@ -667,6 +699,9 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
 
     for idx, bench_id in enumerate(bench_ids):
         bench_sections = fetch_cause_list_for_bench(bench_id, date_str)
+        if bench_sections is None:
+            lost_benches += 1
+            bench_sections = []
         # Throttle inter-bench requests to stay under PHHC rate limits.
         # Without this the server 429s partway through and we silently lose
         # entire benches of records (confirmed on 2026-04-23).
@@ -775,8 +810,9 @@ def fetch_all_cause_list_entries_for_date(date_str, bench_ids):
                     parent_entry['case_year'] = p_year
                     all_entries.append(parent_entry)
 
-    print(f"[CAUSELIST] Fetched {len(all_entries)} entries across {len(court_owner)} courts for {date_str}")
-    return all_entries
+    print(f"[CAUSELIST] Fetched {len(all_entries)} entries across {len(court_owner)} courts "
+          f"for {date_str} ({lost_benches} benches lost)")
+    return all_entries, lost_benches
 
 
 def store_cause_list_entries(entries):
@@ -876,6 +912,17 @@ def scrape_cause_lists():
                 print(f"[CAUSELIST] {cl_date}: all available types already stored, skipping")
                 continue
 
+            # Drop types whose last bench sweep is still fresh (clean sweeps
+            # rest 6h, dirty ones 30min). Keeps small-list days (vacations,
+            # Lok Adalat) from re-sweeping every cycle forever.
+            now_epoch = time.time()
+            rested = {lt for lt in needed_types if not _sweep_allowed(cl_date, lt, now_epoch)}
+            needed_types -= rested
+            if rested:
+                print(f"[CAUSELIST] {cl_date}: {rested} swept recently, resting")
+            if not needed_types:
+                continue
+
             print(f"[CAUSELIST] {cl_date}: need to fetch {needed_types}")
 
             # Fetch bench IDs once per scrape_cause_lists() call
@@ -887,7 +934,14 @@ def scrape_cause_lists():
                 return
 
             # Fetch ALL entries for this date (one pass over all benches)
-            all_entries = fetch_all_cause_list_entries_for_date(cl_date, bench_ids)
+            all_entries, lost_benches = fetch_all_cause_list_entries_for_date(cl_date, bench_ids)
+
+            # Record the sweep outcome for every type we attempted, so the
+            # gate above knows how long this (date, type) can rest. A clean
+            # sweep means the (possibly tiny) result IS the published list.
+            sweep_done = time.time()
+            for lt in needed_types:
+                _sweep_state[(cl_date, lt)] = {"time": sweep_done, "clean": lost_benches == 0}
 
             if not all_entries:
                 print(f"[CAUSELIST] No entries returned for {cl_date}")
@@ -1292,6 +1346,14 @@ OLD_SITE_HEADERS = {
 COMPLETE_LIST_POLL_INTERVAL_SECONDS = 15 * 60  # every 15 minutes
 MIN_COMPLETE_LIST_RECORDS = 1000  # a real Complete List day has 3k-5k+
 _last_complete_poll = {}  # date_str -> epoch seconds
+# Once a date's PDF has been downloaded AND parsed into entries, the list
+# is final (it's the authoritative overnight publication) — re-check only
+# every 6h instead of every 15min. Vacation Complete Lists (~228 entries)
+# never reach MIN_COMPLETE_LIST_RECORDS, so without this the same PDF was
+# re-downloaded and re-parsed 96 times a day. The 15-min poll above still
+# applies to dates whose PDF isn't published yet.
+_complete_parsed_at = {}  # date_str -> epoch seconds of last successful parse
+COMPLETE_REPARSE_INTERVAL_SECONDS = 6 * 3600
 # Throttle between old-site HTTP calls — user asked for an extra-patient
 # runner. 3s between requests is friendly and still fast enough.
 OLD_SITE_THROTTLE_SECONDS = 3.0
@@ -1501,6 +1563,10 @@ def scrape_complete_lists():
         # Already have a complete enough Complete List?
         if _cause_list_counts.get((cl_date, "COMPLETE"), 0) >= MIN_COMPLETE_LIST_RECORDS:
             continue
+        # Already parsed this date's PDF (small-list day)? Rest 6h.
+        parsed_at = _complete_parsed_at.get(cl_date)
+        if parsed_at is not None and (now_epoch - parsed_at) < COMPLETE_REPARSE_INTERVAL_SECONDS:
+            continue
         # Polled too recently?
         last = _last_complete_poll.get(cl_date)
         if last is not None and (now_epoch - last) < COMPLETE_LIST_POLL_INTERVAL_SECONDS:
@@ -1526,6 +1592,7 @@ def scrape_complete_lists():
             continue
 
         store_cause_list_entries(entries)
+        _complete_parsed_at[cl_date] = time.time()
 
 
 # ============================================================
