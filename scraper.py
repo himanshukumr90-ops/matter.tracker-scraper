@@ -554,41 +554,79 @@ def reset_daily_flags():
 # STEP 6 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü CAUSE LIST SCRAPING (JSON API ‚Äö√Ñ√∂‚àö√ë‚àö√Ü no PDF, no Cloudflare)
 # ============================================================
 
+def _fetch_cause_list_rows(filter_params):
+    """Fetch ALL CauseListEntry rows matching filter_params from Base44,
+    paginating with limit/skip. A single unfiltered GET silently caps at
+    5,000 rows (and skip itself caps at ~131k), so callers must filter to
+    a subset — in practice one list_date — and we page through it here."""
+    rows = []
+    skip = 0
+    page_size = 1000
+    while True:
+        try:
+            resp = requests.get(
+                f"{BASE44_URL}/CauseListEntry",
+                params={**filter_params, "limit": page_size, "skip": skip},
+                headers=HEADERS,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"[CAUSELIST] Page fetch HTTP {resp.status_code} for {filter_params}")
+                break
+            batch = resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            skip += page_size
+            time.sleep(0.1)  # be gentle with Base44 between pages
+        except Exception as e:
+            print(f"[CAUSELIST] Page fetch error for {filter_params}: {e}")
+            break
+    return rows
+
+
 def _load_cause_list_cache():
     """Load existing CauseListEntry records from Base44 into the in-memory
     counters and key set. Runs once per process start. We count records per
     (list_date, list_type) so check_existing_cause_list can detect an
     incomplete list and trigger a refetch, and we index every record by
     (date, type, case_number, court_no, item_no) so store_cause_list_entries
-    can skip duplicates during a refetch."""
+    can skip duplicates during a refetch.
+
+    Loaded per-date for today..today+13 — the only dates the scraper
+    (today..+3) and the sync (today..+13) ever touch. The old single
+    unfiltered GET capped at 5,000 rows (the oldest ones), so after a
+    restart the dedup index was missing recent dates entirely and every
+    restart re-inserted duplicates of current entries."""
     global _cache_initialized
     if _cache_initialized:
         return
     try:
-        resp = requests.get(
-            f"{BASE44_URL}/CauseListEntry",
-            headers=HEADERS,
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            records = resp.json()
-            if isinstance(records, list):
-                for r in records:
-                    ld = r.get("list_date")
-                    lt = r.get("list_type")
-                    if not (ld and lt):
-                        continue
-                    _cause_list_counts[(ld, lt)] = _cause_list_counts.get((ld, lt), 0) + 1
-                    key = (
-                        ld,
-                        lt,
-                        r.get("case_number") or "",
-                        r.get("court_number"),
-                        str(r.get("item_number") or ""),
-                    )
-                    _cause_list_keys.add(key)
-                print(f"[CAUSELIST] Loaded cache: {len(records)} records across "
-                      f"{len(_cause_list_counts)} (date, type) pairs from Base44")
+        today = datetime.datetime.now(IST).date()
+        total = 0
+        for d in range(14):
+            ds = (today + timedelta(days=d)).isoformat()
+            records = _fetch_cause_list_rows({"list_date": ds})
+            for r in records:
+                ld = r.get("list_date")
+                lt = r.get("list_type")
+                if not (ld and lt):
+                    continue
+                _cause_list_counts[(ld, lt)] = _cause_list_counts.get((ld, lt), 0) + 1
+                key = (
+                    ld,
+                    lt,
+                    r.get("case_number") or "",
+                    r.get("court_number"),
+                    str(r.get("item_number") or ""),
+                )
+                _cause_list_keys.add(key)
+            total += len(records)
+        print(f"[CAUSELIST] Loaded cache: {total} records across "
+              f"{len(_cause_list_counts)} (date, type) pairs from Base44 "
+              f"({today} .. +13 days)")
         _cache_initialized = True
     except Exception as e:
         print(f"[CAUSELIST] Cache load error: {e}")
@@ -1040,16 +1078,11 @@ def sync_tracked_cases_from_cause_list():
         earliest_match = {}
 
         for date_str in dates_to_check:
-            resp = requests.get(
-                f"{BASE44_URL}/CauseListEntry",
-                params={"list_date": date_str},
-                headers=HEADERS,
-                timeout=15
-            )
-            if resp.status_code != 200:
-                continue
-            entries = resp.json()
-            if not isinstance(entries, list) or not entries:
+            # Paginated: a full term date holds 10k+ rows, far beyond the
+            # 5,000-row cap of a single GET — an unpaginated fetch would
+            # silently miss tracked cases listed in the truncated tail.
+            entries = _fetch_cause_list_rows({"list_date": date_str})
+            if not entries:
                 continue
 
             # Within this date, pick the single BEST entry per tracked
