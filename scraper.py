@@ -1439,15 +1439,35 @@ def download_complete_list_pdf(date_str):
     return path
 
 
+# Case-number token, e.g. "CRM-18484-2023", "CRM-M-33173-2026", or a Civil
+# Misc number with the parent case type embedded between the number and the
+# year, e.g. "CM-2604-LPA-2025" / "CM-5682-CII-2025". The negative lookbehind
+# keeps us out of parenthesised back-references like "(CWP-2297-2020)" (the
+# pre-conversion number printed under a converted case) and stops us matching
+# the tail of a longer token (e.g. "LPA-402-2012" inside "IOIN-LPA-402-2012").
+_CASE_TOKEN = (
+    r"(?P<ct>[A-Z]+(?:-[A-Z]+)*)-(?P<no>\d+)"
+    r"(?:-(?P<sub>[A-Z]+(?:-[A-Z]+)*))?-(?P<yr>\d{4})"
+)
+_CASE_RE = re.compile(r"(?<![(\w-])" + _CASE_TOKEN + r"\b")
 # Match a cause-list entry line like:
 #   "  101 I    KAPURTHALA    CRM-18484-2023  ..."
-# Captures: item, column_marker, case_type, case_no, case_year.
+#   "  244      UT-CHANDIGARH CWP-14926-2024  ..."   (no column marker)
+# Captures: item, optional column_marker, case_type, case_no, case_year.
+# The column marker (roman numeral / asterisks) is OPTIONAL — plenty of
+# rows have none, and requiring it silently dropped them (observed on the
+# 27/04/2026 CR-10 list: items 226, 234, 244, 245, 250, 252, 253).
 _ENTRY_RE = re.compile(
     r"^\s*(?P<item>\d{1,4})\s+"
-    r"(?P<col>[IVX\*]+)\s+"
+    r"(?:(?P<col>[IVX\*]+)\s+)?"
     r"(?P<rest>.{0,60}?)\s+"
-    r"(?P<ct>[A-Z]+(?:-[A-Z]+)*)-(?P<no>\d+)-(?P<yr>\d{4})\b"
+    + _CASE_TOKEN + r"\b"
 )
+# Continuation lines under an item that list connected / parent cases:
+#   "WITH CRM-W-1478-2025 ...", "IN LPA-1056-2025", "& O&M FAO-1814-2025"
+# The IN line is the parent case — the number a lawyer actually tracks —
+# so missing it means missing the user's case entirely.
+_CONN_RE = re.compile(r"^\s*(?:WITH\b|IN\b|&)")
 # Detect the court-room number from section headers like:
 #   "... CR NO 31" or zoom link "vcphhc31"
 _CR_NO_RE = re.compile(r"\bCR\s+NO\s+(\d+)\b")
@@ -1476,52 +1496,34 @@ def parse_complete_list_pdf(pdf_path, date_str):
     entries = []
     seen_keys = set()  # (case_number, court_no, item) dedup within the PDF
     current_court = None
+    current_item = None  # item number the continuation lines belong to
     now_ist = datetime.datetime.now(IST).isoformat(timespec='seconds')
 
-    for line in txt.splitlines():
-        # Track current court room from section headers
-        m_cr = _CR_NO_RE.search(line)
-        if m_cr:
-            try:
-                current_court = int(m_cr.group(1))
-            except ValueError:
-                pass
-            continue
-        m_vc = _VC_LINK_RE.search(line)
-        if m_vc:
-            try:
-                current_court = int(m_vc.group(1))
-            except ValueError:
-                pass
-            # Don't `continue` — vc link might appear on a line that
-            # doesn't also have an entry, but doesn't hurt to try.
+    def _add_entry(case_match, item_raw):
+        """Build and append an entry from a _CASE_TOKEN match, deduped."""
+        case_type = case_match.group("ct")
+        case_no_raw = case_match.group("no")
+        sub_type = case_match.group("sub")
+        case_year = case_match.group("yr")
+        if sub_type:
+            # Civil Misc with parent type embedded: keep the printed form
+            # (e.g. "CM-2604-LPA-2025") as the composite case_number.
+            case_number = f"{case_type}-{case_no_raw}-{sub_type}-{case_year}"
+            case_type = f"{case_type}-{sub_type}"
+        else:
+            case_number = f"{case_type}-{case_no_raw}-{case_year}"
 
-        m = _ENTRY_RE.match(line)
-        if not m or current_court is None:
-            continue
-
-        item_raw = m.group("item")
-        case_type = m.group("ct")
-        case_no_raw = m.group("no")
-        case_year = m.group("yr")
-        case_number = f"{case_type}-{case_no_raw}-{case_year}"
-
-        # Dedup — the same case can appear multiple times in the PDF
-        # (e.g. linked with sub-applications). We keep the first seen.
         key = (case_number, current_court, item_raw)
         if key in seen_keys:
-            continue
+            return
         seen_keys.add(key)
 
         try:
             case_no_int = int(case_no_raw)
         except ValueError:
-            case_no_int = None
-
-        if case_no_int is None:
             # Base44 schema requires a numeric case_no; skip rows whose
             # case number can't be parsed as int (e.g. "12345A").
-            continue
+            return
 
         entries.append({
             "case_number": case_number,
@@ -1538,6 +1540,52 @@ def parse_complete_list_pdf(pdf_path, date_str):
             "downloaded_at": now_ist,
             "last_updated": now_ist,
         })
+
+    for line in txt.splitlines():
+        # Track current court room from section headers. Page headers
+        # repeat the same court number — only a CHANGE of court resets
+        # the current item, so continuation lines that cross a page
+        # break stay attached to their item.
+        m_cr = _CR_NO_RE.search(line)
+        if m_cr:
+            try:
+                new_court = int(m_cr.group(1))
+                if new_court != current_court:
+                    current_court = new_court
+                    current_item = None
+            except ValueError:
+                pass
+            continue
+        m_vc = _VC_LINK_RE.search(line)
+        if m_vc:
+            try:
+                new_court = int(m_vc.group(1))
+                if new_court != current_court:
+                    current_court = new_court
+                    current_item = None
+            except ValueError:
+                pass
+            # Don't `continue` — vc link might appear on a line that
+            # doesn't also have an entry, but doesn't hurt to try.
+
+        if current_court is None:
+            continue
+
+        m = _ENTRY_RE.match(line)
+        if m:
+            current_item = m.group("item")
+            _add_entry(m, current_item)
+            continue
+
+        # Connected / parent cases listed under the current item
+        # ("WITH CRM-W-1478-2025", "IN LPA-1056-2025", "& O&M FAO-..."):
+        # store them at the same item number so a lawyer tracking the
+        # parent case still matches. First case token on the line only —
+        # the rest of the line is party/advocate text.
+        if current_item is not None and _CONN_RE.match(line):
+            cm = _CASE_RE.search(line)
+            if cm:
+                _add_entry(cm, current_item)
 
     print(f"[COMPLETE] {date_str} parsed {len(entries)} entries from PDF")
     return entries
