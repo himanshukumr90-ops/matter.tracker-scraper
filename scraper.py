@@ -587,11 +587,14 @@ def send_push(user_id, notification_type, message):
         # iOS time-sensitive-style priority; court alerts are urgent.
         "priority": 10,
     }
+    # Modern OneSignal keys (os_v2_...) use the "Key" scheme; legacy
+    # REST API keys use "Basic".
+    scheme = "Key" if ONESIGNAL_API_KEY.startswith("os_v2_") else "Basic"
     try:
         r = requests.post(
             ONESIGNAL_URL,
             headers={
-                "Authorization": f"Basic {ONESIGNAL_API_KEY}",
+                "Authorization": f"{scheme} {ONESIGNAL_API_KEY}",
                 "Content-Type": "application/json",
             },
             json=payload,
