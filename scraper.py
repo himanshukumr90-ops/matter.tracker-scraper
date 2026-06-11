@@ -391,16 +391,72 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
     return user_pos
 
 
+# --- Passover-aware notification state (in-memory; cleared daily in main) ---
+# Re-arm a consumed threshold flag only when the effective distance exceeds
+# the threshold by this buffer, so a board oscillating around a threshold
+# (15 <-> 16) can't ping-pong alerts.
+REARM_BUFFER = 3
+# Announce "passovers started" only to cases within this many effective
+# calls. (A per-case notify_passover_always field, once added in settings,
+# overrides this — .get() of the missing field is falsy until then.)
+PASSOVER_ANNOUNCE_DISTANCE = 25
+_court_passover_state = {}   # court_number -> was in passover last cycle
+_passover_episode_num = {}   # court_number -> running episode counter
+_passover_announced = set()  # (case_id, date, court_number, episode)
+
+
+def _remaining_passovers(court):
+    """Calls left in a court's passover queue, counting the one in
+    progress. Board format 140-P(5/10) means passover #5 is being heard
+    NOW (user-confirmed), so #5..#10 = 6 calls remain before regular
+    items resume; when 5 are done the board shows P(6/10) -> 5 remain."""
+    if not court.get("is_passover"):
+        return 0
+    total = court.get("passover_total")
+    if not total:
+        return 0
+    cur = court.get("passover_current") or 1
+    return max(0, total - cur + 1)
+
+
+def rearm_notification_flag(case_id, flag_field, now):
+    payload = {flag_field: True, "last_updated": now}
+    try:
+        requests.put(
+            f"{BASE44_URL}/TrackedCase/{case_id}",
+            headers=HEADERS,
+            json=payload,
+            timeout=15
+        )
+    except requests.RequestException as e:
+        print(f"[ERROR] Could not re-arm {flag_field}: {e}")
+
+
 def check_notifications(court_data, existing_records):
     if not court_data:
-        return
-    cases = get_tracked_cases()
-    if not cases:
+        # Board empty (court not in session) — close any open passover
+        # episodes so tomorrow's first passover counts as a new one.
+        _court_passover_state.clear()
         return
 
     today = datetime.date.today().isoformat()
     now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     queue_cache = {}  # court_number -> sorted [int, ...]; cached per call
+
+    # Track passover episodes per court. An episode begins when a court's
+    # board flips from regular to passover mode; each episode triggers at
+    # most one announcement per tracked case.
+    for cn, court in court_data.items():
+        if court["is_passover"] and not _court_passover_state.get(cn, False):
+            _passover_episode_num[cn] = _passover_episode_num.get(cn, 0) + 1
+        _court_passover_state[cn] = court["is_passover"]
+    for cn in list(_court_passover_state):
+        if cn not in court_data:
+            _court_passover_state[cn] = False
+
+    cases = get_tracked_cases()
+    if not cases:
+        return
 
     for case in cases:
         court_number = case.get("court_number")
@@ -414,31 +470,44 @@ def check_notifications(court_data, existing_records):
         court = court_data[court_number]
         current_item = court["current_item"]
         is_passover = court["is_passover"]
+        remaining_p = _remaining_passovers(court)
 
-        if is_passover and case.get("notify_at_15", True):
-            log_notification(
-                user_id=user_id,
-                case_id=case_id,
-                notification_type="passover_alert",
-                message=(f"Court {court_number} is in Passover Mode. "
-                         f"Your case (Item {item_number}) may be called soon. "
-                         f"Please be on standby."),
-                now=now
-            )
-            continue
-
-        # Prefer queue-aware computation that skips the gap between Urgent
-        # (100s) and Ordinary (200s). Falls back to naive subtraction when
-        # the queue isn't loaded yet (e.g. before the Complete / Urgent /
-        # Ordinary list is published for that date).
-        items_away = _compute_items_away(
+        # Queue-aware gap from the court's current item to the user's item
+        # (skips the Urgent->Ordinary numbering gap). Falls back to naive
+        # subtraction when the queue isn't loaded for that date yet.
+        queue_gap = _compute_items_away(
             queue_cache, court_number, today, current_item, item_number
         )
-        if items_away is None:
+        if queue_gap is None:
             try:
-                items_away = int(item_number) - int(current_item)
+                queue_gap = int(item_number) - int(current_item)
             except (ValueError, TypeError):
                 continue
+
+        # Effective distance counts pending passovers: the court works
+        # through the passover queue before resuming regular items.
+        items_away = queue_gap + remaining_p
+
+        # --- One announcement per passover episode per case ---
+        if is_passover:
+            ep = _passover_episode_num.get(court_number, 0)
+            akey = (case_id, today, court_number, ep)
+            if akey not in _passover_announced and (
+                    items_away <= PASSOVER_ANNOUNCE_DISTANCE
+                    or case.get("notify_passover_always")):
+                _passover_announced.add(akey)
+                log_notification(
+                    user_id=user_id,
+                    case_id=case_id,
+                    notification_type="passover_alert",
+                    message=(f"Court {court_number} has started taking passovers "
+                             f"({court.get('passover_total')} pending). "
+                             f"Your case (Item {item_number}) is now about "
+                             f"{items_away} calls away "
+                             f"({remaining_p} passovers + {queue_gap} regular items)."),
+                    now=now
+                )
+
         if items_away <= 0:
             update_case_status(case_id, "called", now)
             log_notification(
@@ -451,15 +520,31 @@ def check_notifications(court_data, existing_records):
             )
             continue
 
+        # --- Re-arm thresholds the distance has climbed back above ---
+        # (e.g. case was 10 away, a 10-passover episode pushes it to 20:
+        # the consumed 15-flag re-arms so it fires again at 15.)
+        for threshold in THRESHOLDS:
+            flag_field = f"notify_at_{threshold}"
+            if case.get(flag_field) is False and items_away > threshold + REARM_BUFFER:
+                rearm_notification_flag(case_id, flag_field, now)
+                case[flag_field] = True
+
         for threshold in THRESHOLDS:
             flag_field = f"notify_at_{threshold}"
             if items_away <= threshold and case.get(flag_field, True):
+                if remaining_p:
+                    position = (f"({remaining_p} passovers + {queue_gap} regular items; "
+                                f"court is on passover "
+                                f"{court.get('passover_current')} of "
+                                f"{court.get('passover_total')}). ")
+                else:
+                    position = f"Court is currently on Item {current_item}. "
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
                     notification_type=f"{threshold}_away",
                     message=(f"Your case in Court {court_number} is {items_away} items away. "
-                             f"Court is currently on Item {current_item}. "
+                             f"{position}"
                              f"Your case is Item {item_number}."),
                     now=now
                 )
@@ -1733,6 +1818,9 @@ def main():
 
             if last_run_date != current_date:
                 reset_daily_flags()
+                _passover_announced.clear()
+                _passover_episode_num.clear()
+                _court_passover_state.clear()
                 last_run_date = current_date
 
             # --- SCRAPE DISPLAY BOARD ---
