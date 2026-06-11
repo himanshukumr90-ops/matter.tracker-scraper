@@ -552,6 +552,64 @@ def check_notifications(court_data, existing_records):
                 break
 
 
+# ── Push delivery (OneSignal) ──────────────────────────────────
+# No-op until both env vars are set on Railway. The lawyer's device is
+# mapped to the same identifier the scraper has: OneSignal "external id"
+# = the TrackedCase user_id / created_by (Base44 user email). The app
+# (web SDK now, native SDK in the store build) calls OneSignal.login()
+# with that identifier after sign-in; sends here target it directly.
+ONESIGNAL_APP_ID = os.environ.get("ONESIGNAL_APP_ID", "")
+ONESIGNAL_API_KEY = os.environ.get("ONESIGNAL_API_KEY", "")
+ONESIGNAL_URL = "https://onesignal.com/api/v1/notifications"
+
+PUSH_TITLES = {
+    "case_called": "Case being called",
+    "passover_alert": "Passovers started",
+    "15_away": "15 matters away",
+    "10_away": "10 matters away",
+    "5_away": "5 matters away",
+}
+
+
+def send_push(user_id, notification_type, message):
+    """Deliver a push via OneSignal to the user's registered devices.
+    Failures are logged and swallowed — the NotificationLog row is the
+    source of truth; push is best-effort delivery on top of it."""
+    if not (ONESIGNAL_APP_ID and ONESIGNAL_API_KEY and user_id):
+        return
+    title = PUSH_TITLES.get(notification_type, "MatterTracker")
+    payload = {
+        "app_id": ONESIGNAL_APP_ID,
+        "include_external_user_ids": [str(user_id)],
+        "channel_for_external_user_ids": "push",
+        "headings": {"en": title},
+        "contents": {"en": message[:240]},
+        # iOS time-sensitive-style priority; court alerts are urgent.
+        "priority": 10,
+    }
+    try:
+        r = requests.post(
+            ONESIGNAL_URL,
+            headers={
+                "Authorization": f"Basic {ONESIGNAL_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        body = r.json() if r.status_code == 200 else {}
+        if r.status_code == 200 and body.get("id"):
+            print(f"[PUSH] {notification_type} -> {user_id} (id {body['id']})")
+        elif r.status_code == 200 and body.get("errors"):
+            # Typically "All included players are not subscribed" — the
+            # user hasn't registered a device yet. Normal, not an error.
+            print(f"[PUSH] {notification_type} -> {user_id}: no subscribed device")
+        else:
+            print(f"[PUSH] Send failed: {r.status_code} {r.text[:200]}")
+    except requests.RequestException as e:
+        print(f"[PUSH] Send error: {e}")
+
+
 def log_notification(user_id, case_id, notification_type, message, now):
     payload = {
         "user_id": user_id,
@@ -573,6 +631,7 @@ def log_notification(user_id, case_id, notification_type, message, now):
             print(f"[WARN] Notification log failed: {r.status_code} {r.text}")
     except requests.RequestException as e:
         print(f"[ERROR] Notification log error: {e}")
+    send_push(user_id, notification_type, message)
 
 
 def mark_notification_sent(case_id, flag_field, now):
