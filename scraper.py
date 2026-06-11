@@ -1463,6 +1463,22 @@ _ENTRY_RE = re.compile(
     r"(?P<rest>.{0,60}?)\s+"
     + _CASE_TOKEN + r"\b"
 )
+# An item line whose case-number column holds an annotation instead of a
+# case number, e.g.:
+#   "  109 V    FAZILKA          (CA-800)        ABHISHEK ..."
+#   "  112 **   FATEHGARH-SAHIB  (BO DATED 02.06.2026)  MANDI ..."
+# The real case number then appears alone on a continuation line below
+# ("CRM-M-33586-2026"). Six items on the 11/06/2026 Complete List were
+# invisible because of this shape.
+# Leading whitespace is capped: real item numbers sit near the left
+# margin (~10 cols), while party/advocate text lives at col 40+ — without
+# the cap a wrapped address line like "1604 SECTOR 7..." would hijack the
+# current item.
+_ITEM_START_RE = re.compile(
+    r"^\s{0,20}(?P<item>\d{1,4})\s+"
+    r"(?:(?P<col>[IVX\*]+)\s+)?"
+    r"[A-Z(]"
+)
 # Continuation lines under an item that list connected / parent cases:
 #   "WITH CRM-W-1478-2025 ...", "IN LPA-1056-2025", "& O&M FAO-1814-2025"
 # The IN line is the parent case — the number a lawyer actually tracks —
@@ -1497,6 +1513,7 @@ def parse_complete_list_pdf(pdf_path, date_str):
     seen_keys = set()  # (case_number, court_no, item) dedup within the PDF
     current_court = None
     current_item = None  # item number the continuation lines belong to
+    pending_case = False  # current_item has no case number yet (annotation row)
     now_ist = datetime.datetime.now(IST).isoformat(timespec='seconds')
 
     def _add_entry(case_match, item_raw):
@@ -1574,7 +1591,19 @@ def parse_complete_list_pdf(pdf_path, date_str):
         m = _ENTRY_RE.match(line)
         if m:
             current_item = m.group("item")
+            pending_case = False
             _add_entry(m, current_item)
+            continue
+
+        # Item line with an annotation where the case number should be —
+        # register the item and pick its case up from the lines below.
+        m_start = _ITEM_START_RE.match(line)
+        if m_start:
+            current_item = m_start.group("item")
+            pending_case = True
+            continue
+
+        if current_item is None:
             continue
 
         # Connected / parent cases listed under the current item
@@ -1582,10 +1611,20 @@ def parse_complete_list_pdf(pdf_path, date_str):
         # store them at the same item number so a lawyer tracking the
         # parent case still matches. First case token on the line only —
         # the rest of the line is party/advocate text.
-        if current_item is not None and _CONN_RE.match(line):
+        if _CONN_RE.match(line):
             cm = _CASE_RE.search(line)
             if cm:
                 _add_entry(cm, current_item)
+            continue
+
+        # Bare case number on a continuation line resolves a pending item
+        # (the annotation-row shape above). Only the first one counts —
+        # later bare tokens are sub-applications travelling with the case.
+        if pending_case:
+            cm = _CASE_RE.search(line)
+            if cm:
+                _add_entry(cm, current_item)
+                pending_case = False
 
     print(f"[COMPLETE] {date_str} parsed {len(entries)} entries from PDF")
     return entries
