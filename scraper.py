@@ -197,30 +197,68 @@ def scrape_display_board():
 # STEP 2 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü GET EXISTING COURTSTATUS RECORDS FROM BASE44
 # ============================================================
 def get_existing_court_records():
+    """Return {court_number: record_id} mapping each court to its FRESHEST
+    CourtStatus row (by last_updated), so updates always hit the live row and
+    any stale duplicate rows are ignored. Paginated so a duplicate-bloated
+    table can't be silently truncated by the API's row cap.
+
+    Returns None on a fetch FAILURE (distinct from an empty {} dict on a
+    genuine first run). The caller MUST skip writes when None: treating a
+    failed fetch as "no courts exist yet" makes update_court_status re-POST
+    every active court and spawn ~60 duplicate rows — this was the original
+    cause of CourtStatus duplication. A skipped 30s update is harmless;
+    mass-duplication is not."""
+    rows = []
+    skip = 0
+    page = 1000
     try:
-        response = requests.get(
-            f"{BASE44_URL}/CourtStatus",
-            headers=HEADERS,
-            timeout=15
-        )
-        response.raise_for_status()
-        records = response.json()
-        existing = {}
-        for record in records:
-            cn = record.get("court_number")
-            rid = record.get("_id") or record.get("id")
-            if cn and rid:
-                existing[int(cn)] = rid
-        return existing
+        while True:
+            response = requests.get(
+                f"{BASE44_URL}/CourtStatus",
+                params={"limit": page, "skip": skip},
+                headers=HEADERS,
+                timeout=15,
+            )
+            response.raise_for_status()
+            batch = response.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < page:
+                break
+            skip += page
     except requests.RequestException as e:
         print(f"[ERROR] Could not fetch existing CourtStatus records: {e}")
-        return {}
+        return None
+
+    # Keep only the freshest row per court; stale duplicates are ignored
+    # (and will be removed by the one-off cleanup, not re-touched here).
+    best = {}  # court_number -> (last_updated, record_id)
+    for record in rows:
+        cn = record.get("court_number")
+        rid = record.get("_id") or record.get("id")
+        if not (cn and rid):
+            continue
+        lu = record.get("last_updated") or ""
+        cur = best.get(int(cn))
+        if cur is None or lu >= cur[0]:
+            best[int(cn)] = (lu, rid)
+    return {cn: pair[1] for cn, pair in best.items()}
 
 
 # ============================================================
 # STEP 3 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü WRITE COURT DATA TO BASE44
 # ============================================================
 def update_court_status(court_data, existing_records):
+    # Fetch failed this cycle (get_existing_court_records returned None).
+    # Skip ALL writes — re-POSTing every court against a missing map is
+    # exactly what spawned duplicate CourtStatus rows. One stale 30s cycle
+    # is harmless; the next cycle updates normally.
+    if existing_records is None:
+        print("[WARN] CourtStatus update skipped — existing-records fetch failed "
+              "(prevents duplicate rows).")
+        return
+
     today = datetime.date.today().isoformat()
     now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     is_session_active = len(court_data) > 0
