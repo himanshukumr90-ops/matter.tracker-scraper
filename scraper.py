@@ -260,7 +260,7 @@ def update_court_status(court_data, existing_records):
         return
 
     today = datetime.date.today().isoformat()
-    now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
     is_session_active = len(court_data) > 0
 
     if not is_session_active:
@@ -478,7 +478,7 @@ def check_notifications(court_data, existing_records):
         return
 
     today = datetime.date.today().isoformat()
-    now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
     queue_cache = {}  # court_number -> sorted [int, ...]; cached per call
 
     # Track passover episodes per court. An episode begins when a court's
@@ -714,7 +714,7 @@ def reset_daily_flags():
         )
         response.raise_for_status()
         cases = response.json()
-        now = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
         for case in cases:
             case_id = case.get("_id") or case.get("id")
             payload = {
@@ -1325,7 +1325,7 @@ def sync_tracked_cases_from_cause_list():
             return
 
         # --- 3. Update matched TrackedCase records ---
-        now_utc = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
         updated = 0
         for composite, match in earliest_match.items():
             tc = case_map[composite]
@@ -1455,7 +1455,7 @@ def refresh_tracked_cases_from_website():
             print("[WEBREFRESH] No TrackedCase records found.")
             return
 
-        now_utc = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
         today = datetime.datetime.now(IST).date()
         updated = 0
         checked = 0
