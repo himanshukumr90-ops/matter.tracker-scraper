@@ -25,7 +25,7 @@ APP_ID = os.environ.get("BASE44_APP_ID", "YOUR_APP_ID_HERE")
 API_KEY = os.environ.get("BASE44_API_KEY", "YOUR_API_KEY_HERE")
 BASE44_URL = f"https://preview--matter-track-pro.base44.app/api/apps/{APP_ID}/entities"
 
-DISPLAY_BOARD_URL = "https://livedb9010.phhc.gov.in/display_board/public/getRecords?skip=0&limit=500"
+DISPLAY_BOARD_URL = "https://mattertracker-api.vercel.app/phhc/display_board/public/getRecords?skip=0&limit=500"
 SCRAPE_INTERVAL = 30
 THRESHOLDS = [15, 10, 5]
 HEADERS = {
@@ -33,9 +33,9 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Cause list config ‚Äö√Ñ√∂‚àö√ë‚àö√Ü uses livedb9010.phhc.gov.in (no Cloudflare, accessible from Railway)
+# Cause list + display board go through our Vercel bom1 relay (/phhc/*):
 IST = timezone(timedelta(hours=5, minutes=30))
-LIVEDB_BASE = "https://livedb9010.phhc.gov.in"
+LIVEDB_BASE = "https://mattertracker-api.vercel.app/phhc"
 CAUSELIST_SUMMARY_URL = f"{LIVEDB_BASE}/cis_filing/public/getCauseListSummary"
 CAUSELIST_ENTRIES_URL = f"{LIVEDB_BASE}/cis_filing/public/getCauseList"
 ACTIVE_BENCH_URL = f"{LIVEDB_BASE}/cis/judges/active-bench"
@@ -1114,7 +1114,7 @@ def store_cause_list_entries(entries):
 
 def scrape_cause_lists():
     """
-    Main cause list function. Uses direct JSON API on livedb9010.phhc.gov.in ‚Äö√Ñ√∂‚àö√ë‚àö√Ü
+    Main cause list function. Uses the PHHC JSON API via the bom1 relay ‚Äö√Ñ√∂‚àö√ë‚àö√Ü
     no PDF download, no csrt token, no Cloudflare.
 
     Checks today+0 through today+3 for available cause lists.
