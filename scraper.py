@@ -584,7 +584,8 @@ def check_notifications(court_data, existing_records):
                     message=(f"Your case in Court {court_number} is {items_away} items away. "
                              f"{position}"
                              f"Your case is Item {item_number}."),
-                    now=now
+                    now=now,
+                    push_title=(f"{items_away} matter{'s' if items_away != 1 else ''} away")
                 )
                 mark_notification_sent(case_id, flag_field, now)
                 break
@@ -609,13 +610,16 @@ PUSH_TITLES = {
 }
 
 
-def send_push(user_id, notification_type, message):
+def send_push(user_id, notification_type, message, title=None):
     """Deliver a push via OneSignal to the user's registered devices.
     Failures are logged and swallowed — the NotificationLog row is the
     source of truth; push is best-effort delivery on top of it."""
     if not (ONESIGNAL_APP_ID and ONESIGNAL_API_KEY and user_id):
         return
-    title = PUSH_TITLES.get(notification_type, "MatterTracker")
+    # The threshold that ARMED an alert may not match the live distance
+    # (a court can jump mid-block), so callers pass the actual distance
+    # as the title; the static map is the fallback.
+    title = title or PUSH_TITLES.get(notification_type, "MatterTracker")
     payload = {
         "app_id": ONESIGNAL_APP_ID,
         "include_external_user_ids": [str(user_id)],
@@ -651,7 +655,8 @@ def send_push(user_id, notification_type, message):
         print(f"[PUSH] Send error: {e}")
 
 
-def log_notification(user_id, case_id, notification_type, message, now):
+def log_notification(user_id, case_id, notification_type, message, now,
+                     push_title=None):
     payload = {
         "user_id": user_id,
         "case_id": case_id,
@@ -672,7 +677,7 @@ def log_notification(user_id, case_id, notification_type, message, now):
             print(f"[WARN] Notification log failed: {r.status_code} {r.text}")
     except requests.RequestException as e:
         print(f"[ERROR] Notification log error: {e}")
-    send_push(user_id, notification_type, message)
+    send_push(user_id, notification_type, message, title=push_title)
 
 
 def mark_notification_sent(case_id, flag_field, now):
