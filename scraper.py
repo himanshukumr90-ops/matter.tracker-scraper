@@ -1940,6 +1940,14 @@ def main():
     print(f"Scraping every {SCRAPE_INTERVAL} seconds")
     print("=" * 50)
 
+    # Background thread: parse uploaded unofficial cause-list photos
+    # (inert unless ANTHROPIC_API_KEY is set; never blocks this loop).
+    try:
+        from unofficial_parser import start_unofficial_parser
+        start_unofficial_parser()
+    except Exception as e:
+        print(f"[UNOFFICIAL] Parser startup error: {e}")
+
     last_run_date = None
 
     while True:
