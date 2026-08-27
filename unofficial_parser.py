@@ -62,9 +62,12 @@ Return ONLY a JSON object (no markdown fences, no commentary) with this exact sh
   ],
   "clubbed": [["117","246"], ...],   // pairs written as A+B anywhere on the sheet
   "adjournment_slips": [<int>, ...], // items listed under 'Adjournment Slips' / marked 'Adj Slip'
+  "review_flags": ["<one short, specific doubt the reviewer must verify>", ...],
   "confidence": "high" | "medium" | "low",
-  "notes": "<overall caveats: illegible areas, ambiguities, anything cropped out of frame>"
+  "notes": "<overall context: what the sheet is, what was skipped, surrounding clutter>"
 }
+
+review_flags is the reviewer's checklist — it is shown to them in red. EVERY uncertainty that could change a number, its position, or its inclusion MUST appear as its own entry, worded so the reviewer can check it against the photo in seconds, naming the block and the item (e.g. "Incomplete RSA: handwritten 224 may be struck through — confirm it stands", "Third margin pair read as 136+335 — second number smudged, could be 835"). Do not bury number-affecting doubts in notes; notes is for context only. Use an empty array when nothing needs checking.
 
 Domain rules (follow exactly):
 - Item numbers 101-199 are the URGENT list; 200+ are the ORDINARY list. These notices normally resequence only the ordinary items; urgent items run first in serial order unless the sheet says otherwise.
