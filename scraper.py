@@ -16,6 +16,9 @@ import time
 import re
 from datetime import timedelta, timezone
 
+from unofficial_sequence import (
+    build_effective_queue, positions_to_watch, extract_case_type)
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -342,7 +345,7 @@ def get_tracked_cases():
         return []
 
 
-def get_court_queue(court_number, date_str):
+def _official_court_queue(court_number, date_str):
     """
     Return the ordered list of item_numbers (ints, ascending) that a
     given court will work through on a given date. Drawn from the
@@ -383,6 +386,82 @@ def get_court_queue(court_number, date_str):
     return sorted(set(urgent) | set(ordinary))
 
 
+# --- Approved unofficial sequences (resequence the official queue) ---
+# Approved UnofficialCauseList rows for the day, fetched with a short TTL
+# so review-screen approvals reach the counts within ~2 minutes.
+_approved_seq_cache = {"date": None, "fetched": 0.0, "by_court": {}}
+_effective_meta = {}   # (court_number, date_str) -> meta dict or None
+APPROVED_REFRESH_SECS = 120
+
+
+def _approved_blocks_for(date_str):
+    now_s = time.time()
+    if (_approved_seq_cache["date"] != date_str
+            or now_s - _approved_seq_cache["fetched"] > APPROVED_REFRESH_SECS):
+        _approved_seq_cache["fetched"] = now_s  # even on failure: no hammering
+        try:
+            r = requests.get(
+                f"{BASE44_URL}/UnofficialCauseList",
+                params={"date": date_str, "status": "approved", "limit": 500},
+                headers=HEADERS, timeout=15,
+            )
+            if r.status_code == 200:
+                by_court = {}
+                for row in r.json():
+                    cn, pb = row.get("court_no"), row.get("parsed_blocks")
+                    if cn is None or not pb:
+                        continue
+                    try:
+                        by_court[int(float(cn))] = pb
+                    except (ValueError, TypeError):
+                        continue
+                if _approved_seq_cache["date"] != date_str:
+                    _effective_meta.clear()
+                _approved_seq_cache.update({"date": date_str, "by_court": by_court})
+        except requests.RequestException as e:
+            print(f"[UNOFFICIAL] Approved-sequence fetch error: {e}")
+    return _approved_seq_cache["by_court"]
+
+
+def _case_types_for(court_number, date_str):
+    """item_number -> case-type token ('CWP', 'FAO', ...) for one court+date,
+    derived from the cached cause-list case numbers."""
+    out = {}
+    for (ld, _lt, cn, court_no, item_no) in _cause_list_keys:
+        if ld != date_str or court_no != court_number:
+            continue
+        try:
+            item = int(_norm_item_no(item_no))
+        except (ValueError, TypeError):
+            continue
+        ctype = extract_case_type(cn)
+        if ctype:
+            out[item] = ctype
+    return out
+
+
+def get_court_queue(court_number, date_str):
+    """Effective call order for a court+date: the official queue,
+    resequenced by an APPROVED unofficial list when one exists. Stores the
+    resequencing meta (clubbed pairs, tags) in _effective_meta for
+    _compute_items_away and notification wording."""
+    official = _official_court_queue(court_number, date_str)
+    pb = _approved_blocks_for(date_str).get(court_number)
+    if pb and official:
+        try:
+            queue, meta = build_effective_queue(
+                official, _case_types_for(court_number, date_str), pb)
+        except Exception as e:
+            print(f"[UNOFFICIAL] Resequence failed for court {court_number}: {e}")
+            queue, meta = official, None
+        _effective_meta[(court_number, date_str)] = meta
+        if meta:
+            return queue
+        return official
+    _effective_meta[(court_number, date_str)] = None
+    return official
+
+
 def _compute_items_away(queue_cache, court_number, date_str, current_item, user_item):
     """
     Items remaining between the court's current_item and the user's case,
@@ -406,27 +485,49 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
     except (ValueError, TypeError):
         return None
 
-    if user_int is None or user_int not in queue:
+    if user_int is None:
         return None
 
-    user_pos = queue.index(user_int)
+    def _distance(q, watch, cur_int):
+        """Positional gap from the court's position in q to the nearest
+        relevant watch index. watch = sorted queue indices to consider
+        (one normally; two for a clubbed pair). Negative = passed."""
+        if cur_int <= 0:
+            # Court hasn't started (display board sentinel).
+            return watch[0]
+        if cur_int in q:
+            cur = q.index(cur_int)
+        else:
+            # Off-list current (passover item / off-list motion): court's
+            # effective position = largest queue item below it. Only valid
+            # for an ASCENDING queue — callers guard for custom orders.
+            smaller = [x for x in q if x < cur_int]
+            if not smaller:
+                return watch[0]  # court below the whole queue
+            cur = q.index(smaller[-1])
+        deltas = [w - cur for w in watch]
+        upcoming = [d for d in deltas if d >= 0]
+        # Nearest upcoming occurrence; if every occurrence has passed,
+        # the least-negative one (drives taken-up detection).
+        return min(upcoming) if upcoming else max(deltas)
 
-    if current_int <= 0:
-        # Court hasn't started (display board sentinel). User is user_pos
-        # items away from the start.
-        return user_pos
+    meta = _effective_meta.get((court_number, date_str))
+    if meta:
+        watch = positions_to_watch(queue, user_int, meta.get("clubbed"))
+        if watch and (current_int <= 0 or current_int in queue):
+            return _distance(queue, watch, current_int)
+        # Custom order but the board shows an off-list item (or the case
+        # isn't in the effective queue): the ascending-order heuristic
+        # doesn't apply, so degrade gracefully to the official queue —
+        # exactly the pre-resequencing behaviour.
+        official = _official_court_queue(court_number, date_str)
+        if user_int in official:
+            return _distance(official, [official.index(user_int)], current_int)
+        return None
 
-    if current_int in queue:
-        return user_pos - queue.index(current_int)
-
-    # current_int isn't a queue item (e.g. a passover item or off-list
-    # motion). Treat the court's effective position as the largest queue
-    # item less than current_int.
-    smaller = [q for q in queue if q < current_int]
-    if smaller:
-        return user_pos - queue.index(smaller[-1])
-    # Court is at an item below the entire queue → not yet reached.
-    return user_pos
+    if user_int not in queue:
+        return None
+    return _distance(queue, [queue.index(user_int)], current_int)
 
 
 # --- Passover-aware notification state (in-memory; cleared daily in main) ---
@@ -577,6 +678,16 @@ def check_notifications(court_data, existing_records):
                                 f"{court.get('passover_total')}). ")
                 else:
                     position = f"Court is currently on Item {current_item}. "
+                seq_meta = _effective_meta.get((court_number, today))
+                if seq_meta:
+                    position += "Order per today's unofficial list. "
+                    try:
+                        item_tags = seq_meta.get("tags", {}).get(
+                            int(_norm_item_no(item_number)), [])
+                    except (ValueError, TypeError):
+                        item_tags = []
+                    if item_tags:
+                        position += f"Note: {'; '.join(item_tags)}. "
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
