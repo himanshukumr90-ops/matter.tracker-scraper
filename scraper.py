@@ -1411,23 +1411,37 @@ def sync_tracked_cases_from_cause_list():
             if not entries:
                 continue
 
-            # Within this date, pick the single BEST entry per tracked
-            # case by list-type priority: COMPLETE > ORDINARY > URGENT.
+            # Within this date, pick the single BEST entry per tracked case.
             # Complete List (from the old highcourtchd.gov.in site) is the
             # final, authoritative list published overnight before hearing;
             # it trumps Ordinary and Urgent whenever it's present.
-            LIST_TYPE_PRIORITY = {"COMPLETE": 0, "ORDINARY": 1, "URGENT": 2}
-            best_per_case = {}  # cn -> (priority, entry)
+            #
+            # URGENT BEATS ORDINARY (fixed 2026-08-31). A case can be listed
+            # TWICE on the same day in the same court - e.g. CWP-1124-2026 in
+            # Court 1 was URGENT item 131 AND ORDINARY item 267. Courts call
+            # the urgent block (101-150) BEFORE the ordinary block (201+), so
+            # the case is actually taken up at 131. Preferring ORDINARY stored
+            # 267, and every threshold alert then counted towards a position
+            # the court reaches LAST - the lawyer would be notified only after
+            # the case had already been called. Always take the position the
+            # court reaches FIRST; the item-number tie-break makes that hold
+            # even when one list type contains the case more than once.
+            LIST_TYPE_PRIORITY = {"COMPLETE": 0, "URGENT": 1, "ORDINARY": 2}
+            best_per_case = {}  # cn -> (priority, item_number_int, entry)
             for entry in entries:
                 cn = entry.get("case_number")
                 if not cn or cn not in case_map:
                     continue
                 p = LIST_TYPE_PRIORITY.get(entry.get("list_type"), 99)
+                try:
+                    item_i = int(_norm_item_no(entry.get("item_number")))
+                except (TypeError, ValueError):
+                    item_i = 10 ** 9  # unparseable: never wins a tie
                 cur = best_per_case.get(cn)
-                if cur is None or p < cur[0]:
-                    best_per_case[cn] = (p, entry)
+                if cur is None or (p, item_i) < (cur[0], cur[1]):
+                    best_per_case[cn] = (p, item_i, entry)
 
-            for cn, (_, entry) in best_per_case.items():
+            for cn, (_, _, entry) in best_per_case.items():
                 # Only record the EARLIEST date (dates_to_check is ascending)
                 if cn not in earliest_match:
                     earliest_match[cn] = {
