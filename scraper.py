@@ -291,6 +291,7 @@ def update_court_status(court_data, existing_records):
             "passover_current": data["passover_current"],
             "passover_total": data["passover_total"],
             "last_regular_item": data.get("last_regular_item"),
+            "last_queue_item": data.get("last_queue_item"),
             "court_date": today,
             "last_updated": now,
             "is_active": True
@@ -519,15 +520,27 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
         # the least-negative one (drives taken-up detection).
         return min(upcoming) if upcoming else max(deltas)
 
+    if current_int > 0 and current_int in queue:
+        _last_queue_item[court_number] = current_int
+
     meta = _effective_meta.get((court_number, date_str))
     if meta:
         watch = positions_to_watch(queue, user_int, meta.get("clubbed"))
         if watch and (current_int <= 0 or current_int in queue):
             return _distance(queue, watch, current_int)
-        # Custom order but the board shows an off-list item (or the case
-        # isn't in the effective queue): the ascending-order heuristic
-        # doesn't apply, so degrade gracefully to the official queue —
-        # exactly the pre-resequencing behaviour.
+        if watch:
+            # Custom order but the board shows an OFF-LIST item (an
+            # unlisted motion). The court's progress through the sheet
+            # order is wherever it last verifiably was — count from the
+            # last board item that was in the queue rather than reverting
+            # to official-order math (which flips the count wildly, e.g.
+            # 12 -> 47 -> 12 across cycles).
+            lq = _last_queue_item.get(court_number)
+            if lq is not None and lq in queue:
+                return _distance(queue, watch, lq)
+        # The case isn't in the effective queue at all (or no anchor is
+        # known): degrade gracefully to the official queue — exactly the
+        # pre-resequencing behaviour.
         official = _official_court_queue(court_number, date_str)
         if user_int in official:
             return _distance(official, [official.index(user_int)], current_int)
@@ -586,6 +599,12 @@ def rearm_notification_flag(case_id, flag_field, now):
 # resumes from it once the passover queue is done. Persisted to
 # CourtStatus.last_regular_item so the frontend can do the same math.
 _last_regular_item = {}
+# Last board item per court that was IN the effective queue. When the board
+# shows an off-list item (an unlisted motion), a custom sheet order has no
+# sound way to place the court's position from the number alone — but the
+# court's progress through the queue is wherever it last verifiably was.
+# Persisted to CourtStatus.last_queue_item for the frontend.
+_last_queue_item = {}
 
 
 def _update_last_regular(court_data):
@@ -596,6 +615,7 @@ def _update_last_regular(court_data):
         if not d.get("is_passover") and cur and cur > 0:
             _last_regular_item[cn] = cur
         d["last_regular_item"] = _last_regular_item.get(cn)
+        d["last_queue_item"] = _last_queue_item.get(cn)
 
 
 def _seed_last_regular_from_db():
@@ -611,13 +631,17 @@ def _seed_last_regular_from_db():
         for row in r.json():
             if row.get("court_date") != today:
                 continue
-            lr = row.get("last_regular_item")
             cn = row.get("court_number")
-            if lr and cn is not None:
-                try:
-                    _last_regular_item[int(cn)] = int(float(lr))
-                except (ValueError, TypeError):
-                    continue
+            if cn is None:
+                continue
+            for field, store in (("last_regular_item", _last_regular_item),
+                                 ("last_queue_item", _last_queue_item)):
+                val = row.get(field)
+                if val:
+                    try:
+                        store[int(cn)] = int(float(val))
+                    except (ValueError, TypeError):
+                        continue
         if _last_regular_item:
             print(f"[PASSOVER] Seeded last-regular for {len(_last_regular_item)} courts")
     except requests.RequestException:
@@ -2145,6 +2169,7 @@ def main():
                 _passover_episode_num.clear()
                 _court_passover_state.clear()
                 _last_regular_item.clear()
+                _last_queue_item.clear()
                 last_run_date = current_date
 
             # --- SCRAPE DISPLAY BOARD ---
