@@ -148,8 +148,15 @@ def build_effective_queue(official_items, item_case_types, parsed_blocks):
                 continue
             if item < 200:
                 # an urgent item appearing inside an ordinary block without
-                # urgent_edit — treat like a displacement to this position
+                # urgent_edit — treat like a displacement to this position.
+                # Tag it only when it lands BEHIND ordinary work: a sheet
+                # whose first block simply restates the urgent list (Court
+                # 23 style) has displaced nothing.
                 displaced_urgent.add(item)
+                behind_ordinary = any(x >= 200 for x in placed)
+                _place(item, block_tag or (
+                    "displaced from urgent list" if behind_ordinary else None))
+                continue
             _place(item, block_tag)
 
         if rule == "by_case_type":
