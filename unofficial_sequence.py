@@ -167,17 +167,16 @@ def build_effective_queue(official_items, item_case_types, parsed_blocks):
                     if itype and itype in wanted:
                         _place(item, block_tag)
 
-    # Adjournment slips: kept in the queue, called quickly at the start of
-    # the ordinary phase (operator ruling). A slip item explicitly placed
-    # by a block keeps its block position instead.
-    slips = []
+    # Adjournment slips: purely INFORMATIONAL (operator ruling 2026-08-31:
+    # slip cases are called at their sheet position, never pulled forward).
+    # A separate "Adjournment Slips" section on a sheet arrives as its own
+    # block at its printed position (parser rule), so ordering is already
+    # handled by the block loop; here we only tag.
+    slip_items = set()
     for raw in parsed_blocks.get("adjournment_slips") or []:
         item = _as_int(raw)
-        if item is not None and item not in placed and item >= 200:
-            slips.append(item)
-            placed.add(item)
-            _tag(item, "adjournment slip")
-    slips.sort()
+        if item is not None:
+            slip_items.add(item)
 
     # Leftover ordinary items run serial-wise at the REST marker, or at
     # the end when the sheet named no remaining block (domain default).
@@ -192,10 +191,13 @@ def build_effective_queue(official_items, item_case_types, parsed_blocks):
 
     queue = []
     seen = set()
-    for item in urgent_phase + slips + seq:
+    for item in urgent_phase + seq:
         if item not in seen:
             seen.add(item)
             queue.append(item)
+    for item in slip_items:
+        if item in seen:
+            _tag(item, "adjournment slip")
 
     # Unofficial-only items (absent from our official cache) stay in the
     # queue — the court will call them; the cache may simply lag.

@@ -290,6 +290,7 @@ def update_court_status(court_data, existing_records):
             "is_passover": data["is_passover"],
             "passover_current": data["passover_current"],
             "passover_total": data["passover_total"],
+            "last_regular_item": data.get("last_regular_item"),
             "court_date": today,
             "last_updated": now,
             "is_active": True
@@ -406,15 +407,22 @@ def _approved_blocks_for(date_str):
                 headers=HEADERS, timeout=15,
             )
             if r.status_code == 200:
-                by_court = {}
+                # Highest version wins (uploaded_at breaks ties) — the SAME
+                # rule the frontend applies, so push and display can never
+                # count from different sheets when duplicates slip through.
+                best = {}
                 for row in r.json():
                     cn, pb = row.get("court_no"), row.get("parsed_blocks")
                     if cn is None or not pb:
                         continue
                     try:
-                        by_court[int(float(cn))] = pb
+                        cni = int(float(cn))
                     except (ValueError, TypeError):
                         continue
+                    key = (row.get("version") or 1, row.get("uploaded_at") or "")
+                    if cni not in best or key > best[cni][0]:
+                        best[cni] = (key, pb)
+                by_court = {cn: pair[1] for cn, pair in best.items()}
                 if _approved_seq_cache["date"] != date_str:
                     _effective_meta.clear()
                 _approved_seq_cache.update({"date": date_str, "by_court": by_court})
@@ -571,6 +579,51 @@ def rearm_notification_flag(case_id, flag_field, now):
         print(f"[ERROR] Could not re-arm {flag_field}: {e}")
 
 
+# The display board shows the PASSED-OVER matter's number during a
+# passover episode (e.g. "205-P(2/5)"), so current_item stops telling us
+# where the regular sequence paused. Remember the last regular item per
+# court; distance during a passover counts from THERE, because the court
+# resumes from it once the passover queue is done. Persisted to
+# CourtStatus.last_regular_item so the frontend can do the same math.
+_last_regular_item = {}
+
+
+def _update_last_regular(court_data):
+    """Refresh the per-court last-regular-item memory from a scraped board
+    snapshot, and annotate each court dict with the value to use."""
+    for cn, d in court_data.items():
+        cur = d.get("current_item")
+        if not d.get("is_passover") and cur and cur > 0:
+            _last_regular_item[cn] = cur
+        d["last_regular_item"] = _last_regular_item.get(cn)
+
+
+def _seed_last_regular_from_db():
+    """One-time startup seed so a scraper restart mid-episode keeps the
+    pause point. Same-day rows only; failures are harmless (fallback is
+    the old passover-item behaviour)."""
+    today = datetime.date.today().isoformat()
+    try:
+        r = requests.get(f"{BASE44_URL}/CourtStatus",
+                         params={"limit": 500}, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return
+        for row in r.json():
+            if row.get("court_date") != today:
+                continue
+            lr = row.get("last_regular_item")
+            cn = row.get("court_number")
+            if lr and cn is not None:
+                try:
+                    _last_regular_item[int(cn)] = int(float(lr))
+                except (ValueError, TypeError):
+                    continue
+        if _last_regular_item:
+            print(f"[PASSOVER] Seeded last-regular for {len(_last_regular_item)} courts")
+    except requests.RequestException:
+        pass
+
+
 def check_notifications(court_data, existing_records):
     if not court_data:
         # Board empty (court not in session) — close any open passover
@@ -611,15 +664,21 @@ def check_notifications(court_data, existing_records):
         is_passover = court["is_passover"]
         remaining_p = _remaining_passovers(court)
 
-        # Queue-aware gap from the court's current item to the user's item
-        # (skips the Urgent->Ordinary numbering gap). Falls back to naive
-        # subtraction when the queue isn't loaded for that date yet.
+        # Queue-aware gap from the court's position to the user's item
+        # (skips the Urgent->Ordinary numbering gap). During a passover the
+        # board shows the passed-over matter, NOT where the regular
+        # sequence paused — count from the remembered pause point, since
+        # that is where the court resumes. Falls back to naive subtraction
+        # when the queue isn't loaded for that date yet.
+        gap_base = current_item
+        if is_passover and court.get("last_regular_item"):
+            gap_base = court["last_regular_item"]
         queue_gap = _compute_items_away(
-            queue_cache, court_number, today, current_item, item_number
+            queue_cache, court_number, today, gap_base, item_number
         )
         if queue_gap is None:
             try:
-                queue_gap = int(item_number) - int(current_item)
+                queue_gap = int(item_number) - int(gap_base)
             except (ValueError, TypeError):
                 continue
 
@@ -2074,6 +2133,7 @@ def main():
         print(f"[UNOFFICIAL] Parser startup error: {e}")
 
     last_run_date = None
+    _seed_last_regular_from_db()
 
     while True:
         try:
@@ -2084,6 +2144,7 @@ def main():
                 _passover_announced.clear()
                 _passover_episode_num.clear()
                 _court_passover_state.clear()
+                _last_regular_item.clear()
                 last_run_date = current_date
 
             # --- SCRAPE DISPLAY BOARD ---
@@ -2093,6 +2154,7 @@ def main():
                 time.sleep(SCRAPE_INTERVAL)
                 continue
 
+            _update_last_regular(court_data)
             existing_records = get_existing_court_records()
             update_court_status(court_data, existing_records)
             check_notifications(court_data, existing_records)
