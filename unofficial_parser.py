@@ -189,11 +189,41 @@ def _pending_records():
     return out
 
 
+def _auto_approve(rec, parsed):
+    """Should this parse go live without a human click?
+
+    Operator decision 2026-09-01: parse quality was graded across 50+ real
+    sheets with zero confirmed errors, so a clean parse is approved on
+    arrival and the operator UN-approves anything that looks wrong on the
+    review screen. Three things still wait for a human:
+
+      - a terminal parse_error (nothing usable to apply);
+      - confidence "low" — the model's own doubt about the whole sheet;
+      - no court number, tagged or detected — it cannot be applied to a
+        court anyway, and needs a JSON edit to become useful.
+
+    NOTE: review_flags is deliberately NOT a gate. The prompt requires a
+    flag for every number-affecting doubt, so in practice every sheet has
+    them (21/21 and 30/30 on the two graded days) — gating on them would
+    hold back everything. They remain the post-hoc checklist in the UI.
+    """
+    if not isinstance(parsed, dict) or parsed.get("parse_error"):
+        return False
+    if str(parsed.get("confidence", "")).strip().lower() == "low":
+        return False
+    court = rec.get("court_no")
+    if court is None and not isinstance(parsed.get("court_no"), int):
+        return False
+    return True
+
+
 def _write_back(rec, parsed):
     payload = {"parsed_blocks": parsed}
     # Fill an untagged court number from the sheet itself; never override a tag.
     if rec.get("court_no") is None and isinstance(parsed.get("court_no"), int):
         payload["court_no"] = parsed["court_no"]
+    if _auto_approve(rec, parsed):
+        payload["status"] = "approved"
     r = requests.put(
         f"{BASE44_URL}/UnofficialCauseList/{rec['id']}",
         headers=HEADERS, json=payload, timeout=30,
@@ -214,9 +244,11 @@ def _loop():
                     t0 = time.time()
                     parsed = _parse_one(client, rec)
                     _write_back(rec, parsed)
+                    live = "APPROVED" if _auto_approve(rec, parsed) else "held for review"
                     print(f"[UNOFFICIAL] Parsed {rid} ({tag}) in {time.time()-t0:.0f}s: "
                           f"{len(parsed.get('blocks', []))} blocks, "
-                          f"confidence {parsed.get('confidence')}")
+                          f"confidence {parsed.get('confidence')}, "
+                          f"{len(parsed.get('review_flags') or [])} flags -> {live}")
                 except Exception as e:
                     _attempts[rid] = _attempts.get(rid, 0) + 1
                     print(f"[UNOFFICIAL] Parse failed for {rid} ({tag}), "
