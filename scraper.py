@@ -678,6 +678,7 @@ def _get_user_prefs():
                         by_id[uid] = {
                             "global_notifications": u.get("global_notifications", True),
                             "notify_passover": u.get("notify_passover", True),
+                            "notification_thresholds": u.get("notification_thresholds"),
                         }
                 _user_prefs["by_id"] = by_id
             else:
@@ -690,7 +691,8 @@ def _get_user_prefs():
 def _prefs_for(user_id):
     """Preferences for a user, defaulting to everything ON."""
     return _get_user_prefs().get(user_id) or {
-        "global_notifications": True, "notify_passover": True}
+        "global_notifications": True, "notify_passover": True,
+        "notification_thresholds": None}
 
 
 def check_notifications(court_data, existing_records):
@@ -793,18 +795,19 @@ def check_notifications(court_data, existing_records):
             )
             continue
 
+        user_thresholds = _sanitise_thresholds(prefs.get("notification_thresholds"))
+        fired = _fired_thresholds(case)
+
         # --- Re-arm thresholds the distance has climbed back above ---
         # (e.g. case was 10 away, a 10-passover episode pushes it to 20:
-        # the consumed 15-flag re-arms so it fires again at 15.)
-        for threshold in THRESHOLDS:
-            flag_field = f"notify_at_{threshold}"
-            if case.get(flag_field) is False and items_away > threshold + REARM_BUFFER:
-                rearm_notification_flag(case_id, flag_field, now)
-                case[flag_field] = True
+        # the consumed 15-threshold re-arms so it fires again at 15.)
+        rearmed = {t for t in fired if items_away > t + REARM_BUFFER}
+        if rearmed:
+            fired -= rearmed
+            _write_fired(case_id, case, fired, now)
 
-        for threshold in THRESHOLDS:
-            flag_field = f"notify_at_{threshold}"
-            if items_away <= threshold and case.get(flag_field, True):
+        for threshold in user_thresholds:
+            if items_away <= threshold and threshold not in fired:
                 # The title carries the distance and the court, so the body
                 # never repeats either — it only says where the court is now
                 # and where the case sits.
@@ -833,7 +836,14 @@ def check_notifications(court_data, existing_records):
                     push_title=(f"{items_away} matter{plural} away "
                                 f"\u00b7 Court {court_number}")
                 )
-                mark_notification_sent(case_id, flag_field, now)
+                # Consume EVERY threshold the case has already passed, not
+                # just this one. A jump from 20 to 7 crosses 15, 12, 10 and 8
+                # at once; firing them one per cycle would be four pushes in
+                # two minutes for a single approach. One alert, carrying the
+                # real distance, and the rest are spent.
+                _write_fired(case_id, case,
+                             fired | {t for t in user_thresholds if t >= items_away},
+                             now)
                 break
 
 
@@ -929,6 +939,66 @@ def log_notification(user_id, case_id, notification_type, message, now,
     send_push(user_id, notification_type, message, title=push_title)
 
 
+# --- Alert thresholds ------------------------------------------------------
+# Users pick their own thresholds in Notification Settings
+# (User.notification_thresholds). The three legacy columns on TrackedCase
+# (notify_at_15/10/5) cannot record a custom one like 8 having fired, so
+# TrackedCase.notified_thresholds — a list of the thresholds already fired
+# today — is now the general store. The legacy columns are still written and
+# still read, so a case mid-day when this shipped keeps its armed state
+# instead of re-firing alerts it had already sent.
+LEGACY_THRESHOLD_COLUMNS = {15, 10, 5}
+MAX_USER_THRESHOLDS = 6      # keep one case's alert budget sane
+MAX_THRESHOLD_VALUE = 200
+
+
+def _sanitise_thresholds(raw):
+    """A user's chosen thresholds -> a clean descending list of ints.
+    Falls back to the classic 15/10/5 if the value is unusable."""
+    out = set()
+    for v in raw if isinstance(raw, list) else []:
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= MAX_THRESHOLD_VALUE:
+            out.add(n)
+    if not out:
+        return list(THRESHOLDS)
+    return sorted(out, reverse=True)[:MAX_USER_THRESHOLDS]
+
+
+def _fired_thresholds(case):
+    """Thresholds already fired for this case today, reading the new list and
+    the legacy columns together so neither store can lose state."""
+    fired = set()
+    for v in case.get("notified_thresholds") or []:
+        try:
+            fired.add(int(float(v)))
+        except (TypeError, ValueError):
+            continue
+    for t in LEGACY_THRESHOLD_COLUMNS:
+        if case.get(f"notify_at_{t}") is False:
+            fired.add(t)
+    return fired
+
+
+def _write_fired(case_id, case, fired, now):
+    """Persist the fired set to both stores and to the in-memory case dict."""
+    payload = {"notified_thresholds": sorted(fired, reverse=True),
+               "last_updated": now}
+    for t in LEGACY_THRESHOLD_COLUMNS:
+        payload[f"notify_at_{t}"] = t not in fired
+    case["notified_thresholds"] = payload["notified_thresholds"]
+    for t in LEGACY_THRESHOLD_COLUMNS:
+        case[f"notify_at_{t}"] = payload[f"notify_at_{t}"]
+    try:
+        requests.put(f"{BASE44_URL}/TrackedCase/{case_id}",
+                     headers=HEADERS, json=payload, timeout=15)
+    except requests.RequestException as e:
+        print(f"[ERROR] Could not update fired thresholds: {e}")
+
+
 def mark_notification_sent(case_id, flag_field, now):
     payload = {flag_field: False, "last_updated": now}
     try:
@@ -975,6 +1045,7 @@ def reset_daily_flags():
                 "notify_at_15": True,
                 "notify_at_10": True,
                 "notify_at_5": True,
+                "notified_thresholds": [],
                 "status": "pending",
                 "last_updated": now
             }
