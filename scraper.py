@@ -2156,6 +2156,14 @@ def main():
     except Exception as e:
         print(f"[UNOFFICIAL] Parser startup error: {e}")
 
+    # Background thread: parse uploaded daily sitting-roster photos
+    # (which courts are not holding court). Same inert-without-key rule.
+    try:
+        from roster_parser import start_roster_parser
+        start_roster_parser()
+    except Exception as e:
+        print(f"[ROSTER] Parser startup error: {e}")
+
     last_run_date = None
     _seed_last_regular_from_db()
 
