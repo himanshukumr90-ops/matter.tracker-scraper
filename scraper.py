@@ -557,8 +557,8 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
 # (15 <-> 16) can't ping-pong alerts.
 REARM_BUFFER = 3
 # Announce "passovers started" only to cases within this many effective
-# calls. (A per-case notify_passover_always field, once added in settings,
-# overrides this — .get() of the missing field is falsy until then.)
+# calls, and only when the user has passover alerts on (a single global
+# setting since 2026-09-07 — it used to be a per-case toggle on Case Detail).
 PASSOVER_ANNOUNCE_DISTANCE = 25
 _court_passover_state = {}   # court_number -> was in passover last cycle
 _passover_episode_num = {}   # court_number -> running episode counter
@@ -648,6 +648,51 @@ def _seed_last_regular_from_db():
         pass
 
 
+# --- Per-user notification preferences -------------------------------------
+# The Notification Settings screen writes global_notifications / notify_passover
+# / notification_thresholds onto the USER record. Until 2026-09-07 the scraper
+# read none of them, so that screen was cosmetic: a user who switched
+# notifications off still got them. These are read here with the server
+# api_key (which bypasses the per-user read rules).
+#
+# FAILING OPEN IS DELIBERATE. If the fetch fails or a user has no record we
+# treat notifications as ON. Sending an alert someone muted is an annoyance;
+# withholding one they needed means a missed hearing, which is the whole
+# failure this product exists to prevent.
+_user_prefs = {"fetched": 0.0, "by_id": {}}
+USER_PREFS_REFRESH_SECS = 300
+
+
+def _get_user_prefs():
+    now_s = time.time()
+    if now_s - _user_prefs["fetched"] > USER_PREFS_REFRESH_SECS:
+        _user_prefs["fetched"] = now_s  # even on failure: no hammering
+        try:
+            r = requests.get(f"{BASE44_URL}/User", params={"limit": 1000},
+                             headers=HEADERS, timeout=15)
+            if r.status_code == 200 and isinstance(r.json(), list):
+                by_id = {}
+                for u in r.json():
+                    uid = u.get("id")
+                    if uid:
+                        by_id[uid] = {
+                            "global_notifications": u.get("global_notifications", True),
+                            "notify_passover": u.get("notify_passover", True),
+                        }
+                _user_prefs["by_id"] = by_id
+            else:
+                print(f"[PREFS] User fetch HTTP {r.status_code} — failing open")
+        except requests.RequestException as e:
+            print(f"[PREFS] User fetch error ({e}) — failing open")
+    return _user_prefs["by_id"]
+
+
+def _prefs_for(user_id):
+    """Preferences for a user, defaulting to everything ON."""
+    return _get_user_prefs().get(user_id) or {
+        "global_notifications": True, "notify_passover": True}
+
+
 def check_notifications(court_data, existing_records):
     if not court_data:
         # Board empty (court not in session) — close any open passover
@@ -683,6 +728,10 @@ def check_notifications(court_data, existing_records):
         if court_number not in court_data:
             continue
 
+        prefs = _prefs_for(user_id)
+        if prefs.get("global_notifications") is False:
+            continue  # user muted every alert in Notification Settings
+
         court = court_data[court_number]
         current_item = court["current_item"]
         is_passover = court["is_passover"]
@@ -714,9 +763,11 @@ def check_notifications(court_data, existing_records):
         if is_passover:
             ep = _passover_episode_num.get(court_number, 0)
             akey = (case_id, today, court_number, ep)
-            if akey not in _passover_announced and (
-                    items_away <= PASSOVER_ANNOUNCE_DISTANCE
-                    or case.get("notify_passover_always")):
+            # Passover alerts are now a single global user setting; the old
+            # per-case notify_passover_always field is no longer consulted.
+            if (akey not in _passover_announced
+                    and prefs.get("notify_passover") is not False
+                    and items_away <= PASSOVER_ANNOUNCE_DISTANCE):
                 _passover_announced.add(akey)
                 log_notification(
                     user_id=user_id,
