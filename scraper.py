@@ -948,13 +948,17 @@ def log_notification(user_id, case_id, notification_type, message, now,
 # still read, so a case mid-day when this shipped keeps its armed state
 # instead of re-firing alerts it had already sent.
 LEGACY_THRESHOLD_COLUMNS = {15, 10, 5}
-MAX_USER_THRESHOLDS = 6      # keep one case's alert budget sane
+# No cap on how many thresholds a user may choose (operator decision
+# 2026-09-07): it is their phone. The value range below still bounds the
+# count implicitly — thresholds are deduped whole numbers in 1..200, so a
+# user cannot supply more than 200 distinct ones however they are written.
 MAX_THRESHOLD_VALUE = 200
 
 
 def _sanitise_thresholds(raw):
     """A user's chosen thresholds -> a clean descending list of ints.
-    Falls back to the classic 15/10/5 if the value is unusable."""
+    Deduped, ordered, range-checked; no limit on how many. Falls back to
+    the classic 15/10/5 if the value is unusable."""
     out = set()
     for v in raw if isinstance(raw, list) else []:
         try:
@@ -965,7 +969,7 @@ def _sanitise_thresholds(raw):
             out.add(n)
     if not out:
         return list(THRESHOLDS)
-    return sorted(out, reverse=True)[:MAX_USER_THRESHOLDS]
+    return sorted(out, reverse=True)
 
 
 def _fired_thresholds(case):
