@@ -722,12 +722,10 @@ def check_notifications(court_data, existing_records):
                     user_id=user_id,
                     case_id=case_id,
                     notification_type="passover_alert",
-                    message=(f"Court {court_number} has started taking passovers "
-                             f"({court.get('passover_total')} pending). "
-                             f"Your case (Item {item_number}) is now about "
-                             f"{items_away} calls away "
-                             f"({remaining_p} passovers + {queue_gap} regular items)."),
-                    now=now
+                    message=(f"{items_away} away: {remaining_p} passovers "
+                             f"+ {queue_gap} items. Your item {item_number}."),
+                    now=now,
+                    push_title=f"Passovers started \u00b7 Court {court_number}"
                 )
 
         if items_away <= 0:
@@ -736,9 +734,11 @@ def check_notifications(court_data, existing_records):
                 user_id=user_id,
                 case_id=case_id,
                 notification_type="case_called",
-                message=(f"Your case (Item {item_number}) in Court {court_number} "
-                         f"is being called or has been called."),
-                now=now
+                # "reached" covers both cases honestly: the board may be ON the
+                # item or may have just passed it.
+                message=f"Item {item_number} has been reached.",
+                now=now,
+                push_title=f"Your case is up \u00b7 Court {court_number}"
             )
             continue
 
@@ -754,32 +754,33 @@ def check_notifications(court_data, existing_records):
         for threshold in THRESHOLDS:
             flag_field = f"notify_at_{threshold}"
             if items_away <= threshold and case.get(flag_field, True):
+                # The title carries the distance and the court, so the body
+                # never repeats either — it only says where the court is now
+                # and where the case sits.
                 if remaining_p:
-                    position = (f"({remaining_p} passovers + {queue_gap} regular items; "
-                                f"court is on passover "
-                                f"{court.get('passover_current')} of "
-                                f"{court.get('passover_total')}). ")
+                    position = (f"{remaining_p} passovers + {queue_gap} items to go. ")
                 else:
-                    position = f"Court is currently on Item {current_item}. "
+                    position = f"Now on item {current_item}. "
+                body = f"{position}Your item {item_number}."
                 seq_meta = _effective_meta.get((court_number, today))
                 if seq_meta:
-                    position += "Order per today's unofficial list. "
+                    body += " Unofficial order."
                     try:
                         item_tags = seq_meta.get("tags", {}).get(
                             int(_norm_item_no(item_number)), [])
                     except (ValueError, TypeError):
                         item_tags = []
                     if item_tags:
-                        position += f"Note: {'; '.join(item_tags)}. "
+                        body += f" {'; '.join(item_tags).capitalize()}."
+                plural = "s" if items_away != 1 else ""
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
                     notification_type=f"{threshold}_away",
-                    message=(f"Your case in Court {court_number} is {items_away} items away. "
-                             f"{position}"
-                             f"Your case is Item {item_number}."),
+                    message=body,
                     now=now,
-                    push_title=(f"{items_away} matter{'s' if items_away != 1 else ''} away")
+                    push_title=(f"{items_away} matter{plural} away "
+                                f"\u00b7 Court {court_number}")
                 )
                 mark_notification_sent(case_id, flag_field, now)
                 break
@@ -795,8 +796,11 @@ ONESIGNAL_APP_ID = os.environ.get("ONESIGNAL_APP_ID", "")
 ONESIGNAL_API_KEY = os.environ.get("ONESIGNAL_API_KEY", "")
 ONESIGNAL_URL = "https://onesignal.com/api/v1/notifications"
 
+# Fallback titles only — every caller now passes an explicit push_title that
+# also names the court. Kept so a future caller that forgets one still sends
+# something sensible rather than "MatterTracker".
 PUSH_TITLES = {
-    "case_called": "Case being called",
+    "case_called": "Your case is up",
     "passover_alert": "Passovers started",
     "15_away": "15 matters away",
     "10_away": "10 matters away",
