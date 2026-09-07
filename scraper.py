@@ -1790,6 +1790,12 @@ import tempfile
 OLD_SITE_BASE = "https://highcourtchd.gov.in"
 OLD_SITE_FORM_URL = f"{OLD_SITE_BASE}/view_causeList.php"
 OLD_SITE_PDF_URL = f"{OLD_SITE_BASE}/show_cause_list.php"
+# highcourtchd.gov.in became India-only before 2026-09-07 (Railway/EU gets a
+# bare TCP connect timeout; the same call from India connects in 0.13s), so
+# the Complete List now goes through our Mumbai relay like the live API does.
+# The PDF is ~5.1MB, over the serverless response cap, and the upstream
+# ignores Range headers — so the relay slices and we reassemble here.
+OLD_SITE_RELAY = "https://mattertracker-api.vercel.app/phhc-old"
 # Static CSRF token the site accepts — it's just 'phhc-team' hex-encoded.
 OLD_SITE_CSRF = "706868632d7465616d"
 OLD_SITE_HEADERS = {
@@ -1840,58 +1846,80 @@ def download_complete_list_pdf(date_str):
         return None
     ddmmyyyy = d.strftime("%d/%m/%Y")
 
-    # --- Step 1: POST to view_causeList.php to get obfuscated filename ---
-    try:
-        _old_site_throttle()
-        r = requests.post(
-            OLD_SITE_FORM_URL,
-            headers={**OLD_SITE_HEADERS, "X-Requested-With": "XMLHttpRequest"},
-            data={
-                "csrf_token": OLD_SITE_CSRF,
-                "t_f_date": ddmmyyyy,
-                "urg_ord": "B",  # B = Complete List
-                "action": "show_causeList",
-            },
-            timeout=30,
-        )
-    except Exception as e:
-        print(f"[COMPLETE] {date_str} form POST failed: {e}")
-        return None
-    if r.status_code != 200:
-        print(f"[COMPLETE] {date_str} form POST HTTP {r.status_code}")
-        return None
-
-    m = re.search(r"filename=([A-Za-z0-9]+)", r.text)
-    if not m:
-        # Either no Complete List published yet for this date, or the
-        # page layout changed.
-        return None
-    obfuscated = m.group(1)
-
-    # --- Step 2: GET the PDF ---
+    # --- Step 1: ask the relay for the date's obfuscated filename ---
     try:
         _old_site_throttle()
         r = requests.get(
-            OLD_SITE_PDF_URL,
-            params={"filename": obfuscated},
-            headers=OLD_SITE_HEADERS,
-            timeout=120,  # PDFs are ~4MB
+            f"{OLD_SITE_RELAY}/causelist-name",
+            params={"date": date_str, "urg_ord": "B"},  # B = Complete List
+            timeout=30,
         )
     except Exception as e:
-        print(f"[COMPLETE] {date_str} PDF GET failed: {e}")
+        print(f"[COMPLETE] {date_str} filename lookup failed: {e}")
         return None
     if r.status_code != 200:
-        print(f"[COMPLETE] {date_str} PDF GET HTTP {r.status_code}")
+        print(f"[COMPLETE] {date_str} filename lookup HTTP {r.status_code}: "
+              f"{r.text[:120]}")
         return None
-    if "application/pdf" not in r.headers.get("Content-Type", ""):
-        print(f"[COMPLETE] {date_str} PDF GET got non-PDF content")
+    try:
+        obfuscated = (r.json() or {}).get("filename")
+    except ValueError:
+        print(f"[COMPLETE] {date_str} filename lookup returned non-JSON")
+        return None
+    if not obfuscated:
+        # No Complete List published for this date yet. Normal, not an error.
         return None
 
-    # Save to temp file
+    # --- Step 2: pull the PDF through the relay, one slice at a time ---
+    parts = []
+    chunk = 0
+    expected_chunks = None
+    expected_total = None
+    while True:
+        try:
+            _old_site_throttle()
+            r = requests.get(
+                f"{OLD_SITE_RELAY}/causelist-pdf",
+                params={"filename": obfuscated, "chunk": chunk},
+                timeout=60,
+            )
+        except Exception as e:
+            print(f"[COMPLETE] {date_str} PDF chunk {chunk} failed: {e}")
+            return None
+        if r.status_code != 200:
+            print(f"[COMPLETE] {date_str} PDF chunk {chunk} HTTP "
+                  f"{r.status_code}: {r.text[:120]}")
+            return None
+        if expected_chunks is None:
+            try:
+                expected_chunks = int(r.headers.get("X-Chunk-Count", "1"))
+                expected_total = int(r.headers.get("X-Total-Size", "0"))
+            except ValueError:
+                expected_chunks, expected_total = 1, 0
+        parts.append(r.content)
+        chunk += 1
+        if chunk >= (expected_chunks or 1):
+            break
+        if chunk > 20:  # runaway guard; a Complete List is ~2 slices
+            print(f"[COMPLETE] {date_str} too many PDF chunks, aborting")
+            return None
+
+    data = b"".join(parts)
+    # A truncated reassembly would be parsed as a short cause list and could
+    # silently drop hundreds of items, so verify the size the relay promised.
+    if expected_total and len(data) != expected_total:
+        print(f"[COMPLETE] {date_str} PDF size mismatch: got {len(data)}, "
+              f"relay said {expected_total} — discarding")
+        return None
+    if not data.startswith(b"%PDF"):
+        print(f"[COMPLETE] {date_str} reassembled bytes are not a PDF")
+        return None
+
     fd, path = tempfile.mkstemp(prefix=f"cl_{date_str}_", suffix=".pdf")
     with os.fdopen(fd, "wb") as f:
-        f.write(r.content)
-    print(f"[COMPLETE] {date_str} downloaded PDF ({len(r.content) // 1024} KB)")
+        f.write(data)
+    print(f"[COMPLETE] {date_str} downloaded PDF ({len(data) // 1024} KB "
+          f"in {chunk} chunk(s) via relay)")
     return path
 
 
