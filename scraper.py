@@ -1209,7 +1209,14 @@ def reset_daily_flags():
             # restart cannot lose it; update_case_status, _write_fired and
             # mark_notification_sent all stamp last_updated, so any case whose
             # state was set today is correctly skipped.
-            if str(case.get("last_updated") or "")[:10] == today:
+            # Use Base44's OWN updated_date, not last_updated.  VERIFIED
+            # 2026-09-08 by dumping the entity's keys: TrackedCase has NO
+            # last_updated field, so every write of it by update_case_status,
+            # _write_fired and mark_notification_sent has been silently
+            # discarded.  updated_date is maintained by Base44 on every write,
+            # so it cannot be forgotten or dropped.
+            stamp = str(case.get("updated_date") or case.get("last_updated") or "")
+            if stamp[:10] == today:
                 skipped += 1
                 continue
             payload = {
