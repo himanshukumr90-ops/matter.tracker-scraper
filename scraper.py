@@ -333,10 +333,15 @@ def get_tracked_cases():
         response.raise_for_status()
         all_cases = response.json()
         today = datetime.date.today().isoformat()
+        # NOTE: status is deliberately NOT a filter any more.  It used to be
+        # `status == "pending"`, which meant announcing a case removed it from
+        # monitoring for the rest of the day -- so a matter wrongly marked
+        # called went silent, and a genuine one that was passed over and taken
+        # up again was never followed.  "called" now records only that we have
+        # ANNOUNCED it; it no longer decides whether we watch it.
         active_cases = [
             c for c in all_cases
-            if c.get("status") == "pending"
-            and c.get("case_date", "") == today
+            if c.get("case_date", "") == today
             and c.get("notifications_enabled", True)
             and c.get("court_number") is not None
             and c.get("item_number") is not None
@@ -695,6 +700,114 @@ def _prefs_for(user_id):
         "notification_thresholds": None}
 
 
+# ---------------------------------------------------------------------------
+# Per-case board status (added 2026-09-08).
+#
+# The court publishes, for every case on a court's list, that case's OWN
+# hearing_status:  "I" = being heard right now, "Y" = already taken up,
+# "N" = not yet called.  That is ground truth for "has this matter been
+# called", and it replaces inferring it from the single current-item number
+# plus an assumed ascending order.  The inference is simply wrong on a court
+# that sits out of numeric order: on 2026-09-08 court 58 worked items 220-234
+# in the morning and then went back to 118, and a tracked item 205 was
+# announced "called" at 10:31 while the court's own record still showed it
+# uncalled.
+#
+# MEASURED CONSTRAINT, and the reason for the size check below: this endpoint
+# intermittently returns a TRUNCATED payload -- about 1 call in 40 across a
+# 76-sample run (court 58 returned 26 rows instead of 205; court 10 returned
+# 43 instead of 105, both recovering on the next poll).  In a truncated
+# payload the user's case is usually ABSENT ENTIRELY, so a naive reader would
+# conclude "not on the board".  Every response is therefore checked against
+# the largest count already seen for that court+date, and a short one is
+# discarded in favour of the last good payload.
+# ---------------------------------------------------------------------------
+BOARD_DETAILS_URL = f"{LIVEDB_BASE}/display_board/public/getDisplayDetails"
+# A payload under this fraction of the best count seen today for the court is
+# treated as truncated.  A real list only ever grows during the day (a case
+# can be added); it does not shrink.
+BOARD_MIN_COMPLETE_RATIO = 0.8
+_board_best = {}   # (court_number, date_str) -> {"rows": [...], "count": int}
+
+
+def _norm_case_key(case_type, case_no, case_year):
+    """Canonical (TYPE, number, year) so a board row and a TrackedCase row
+    compare equal despite Base44 floats and stray spacing.  Matching on the
+    CASE NUMBER rather than the item number also sidesteps the long-standing
+    D.B./S.B. problem, where two benches in one court can share item 205 but
+    never share a case number."""
+    ctype = str(case_type or "").strip().upper()
+    num = _norm_item_no(case_no)
+    yr = _norm_item_no(case_year)
+    if not ctype or not num or not yr:
+        return None
+    return (ctype, num, yr)
+
+
+def _fetch_board_details(court_number, date_str):
+    """Every case on one court's board, or None when nothing trustworthy is
+    available.  Never raises."""
+    key = (court_number, date_str)
+    best = _board_best.get(key)
+    headers = {
+        "Referer": "https://new.phhc.gov.in/",
+        "Origin": "https://new.phhc.gov.in",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+    try:
+        r = requests.get(
+            BOARD_DETAILS_URL,
+            params={"court_no": court_number, "skip": 0, "limit": 500},
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"[BOARD] court {court_number}: fetch failed ({e})")
+        return best["rows"] if best else None
+
+    rows = []
+    if isinstance(data, dict):
+        for group in data.values():
+            for bench in (group or []):
+                rows.extend(bench.get("cases") or [])
+
+    if best and len(rows) < best["count"] * BOARD_MIN_COMPLETE_RATIO:
+        print(f"[BOARD] court {court_number}: truncated payload "
+              f"({len(rows)} rows vs {best['count']} seen); keeping last good")
+        return best["rows"]
+    if not rows:
+        return best["rows"] if best else None
+    # Keep the high-water count as the yardstick, but always store the newest
+    # rows -- statuses advance through the day even when the count does not.
+    _board_best[key] = {"rows": rows,
+                        "count": max(len(rows), best["count"] if best else 0)}
+    return rows
+
+
+def _board_status_for_case(board_cache, court_number, date_str, case):
+    """('I'|'Y'|'N', row) for this case on that court's board, or (None, None)
+    when there is no trustworthy answer -- board unavailable, or the case is
+    not on it.  Cached per court for the life of one cycle."""
+    if court_number not in board_cache:
+        board_cache[court_number] = _fetch_board_details(court_number, date_str)
+    rows = board_cache[court_number]
+    if not rows:
+        return None, None
+    want = _norm_case_key(case.get("case_type"), case.get("case_number"),
+                          case.get("case_year"))
+    if not want:
+        return None, None
+    for row in rows:
+        if _norm_case_key(row.get("case_type"), row.get("case_no"),
+                          row.get("case_year")) == want:
+            status = (row.get("hearing_status") or "").strip().upper()
+            return (status or None), row
+    return None, None
+
+
 def check_notifications(court_data, existing_records):
     if not court_data:
         # Board empty (court not in session) — close any open passover
@@ -705,6 +818,7 @@ def check_notifications(court_data, existing_records):
     today = datetime.date.today().isoformat()
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
     queue_cache = {}  # court_number -> sorted [int, ...]; cached per call
+    board_cache = {}  # court_number -> board rows; one fetch per court per cycle
 
     # Track passover episodes per court. An episode begins when a court's
     # board flips from regular to passover mode; each episode triggers at
@@ -781,18 +895,56 @@ def check_notifications(court_data, existing_records):
                     push_title=f"Passovers started \u00b7 Court {court_number}"
                 )
 
-        if items_away <= 0:
-            update_case_status(case_id, "called", now)
-            log_notification(
-                user_id=user_id,
-                case_id=case_id,
-                notification_type="case_called",
-                # "reached" covers both cases honestly: the board may be ON the
-                # item or may have just passed it.
-                message=f"Item {item_number} has been reached.",
-                now=now,
-                push_title=f"Your case is up \u00b7 Court {court_number}"
-            )
+        # --- Has this matter actually been called? ---
+        # Ask the court, not the arithmetic.  "called" on the case record now
+        # means only "we have already announced this"; it no longer stops us
+        # watching, so a wrong announcement costs one push instead of a day of
+        # silence, and it heals itself on the next cycle.
+        board_status, _board_row = _board_status_for_case(
+            board_cache, court_number, today, case)
+        already_announced = case.get("status") == "called"
+
+        def _announce_called():
+                update_case_status(case_id, "called", now)
+                log_notification(
+                    user_id=user_id,
+                    case_id=case_id,
+                    notification_type="case_called",
+                    # "reached" covers both cases honestly: the board may be ON the
+                    # item or may have just passed it.
+                    message=f"Item {item_number} has been reached.",
+                    now=now,
+                    push_title=f"Your case is up \u00b7 Court {court_number}"
+                )
+
+        if board_status == "N":
+            # The court's own record says this matter has NOT been taken up.
+            # Never announce it, whatever the item arithmetic suggests, and
+            # clear a flag an earlier inferred run set wrongly -- that restores
+            # the 15/10/5 run for a case like the one falsely called at 10:31
+            # on 2026-09-08.  Then fall through to the distance alerts.
+            if already_announced:
+                print(f"[BOARD] case {case_id}: court {court_number} says item "
+                      f"{item_number} is not yet called; clearing stale flag")
+                update_case_status(case_id, "pending", now)
+        elif board_status in ("I", "Y"):
+            # I = being heard right now, Y = already taken up.  Both mean the
+            # matter has been reached; announce once, then stop for the day.
+            # Y never reverts to N (verified over a 76-sample run), so this is
+            # safe to treat as final.
+            if not already_announced:
+                _announce_called()
+            continue
+        elif items_away <= 0:
+            # No trustworthy board answer -- the court list was unavailable, or
+            # this case is not on it.  Fall back to the item arithmetic, the
+            # path that produced false calls before the per-case status
+            # existed, so say so in the log.  Withholding the alert would risk
+            # a missed hearing, and a wrong one no longer blinds us.
+            if not already_announced:
+                print(f"[BOARD] case {case_id}: no board confirmation for court "
+                      f"{court_number}; announcing on distance alone")
+                _announce_called()
             continue
 
         user_thresholds = _sanitise_thresholds(prefs.get("notification_thresholds"))
@@ -1043,8 +1195,23 @@ def reset_daily_flags():
         response.raise_for_status()
         cases = response.json()
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
+        today = datetime.date.today().isoformat()
+        skipped = 0
         for case in cases:
             case_id = case.get("_id") or case.get("id")
+            # Only reset rows untouched since an EARLIER day.  This runs on a
+            # new day AND on every process start (last_run_date is a plain
+            # in-memory local), so without this check every restart wiped
+            # status and the armed-threshold flags for every case -- which
+            # re-announced "your case is up" for anything already called that
+            # day.  Six deploys on 2026-09-07 produced six duplicate pushes.
+            # The date now lives on the RECORD, not in the process, so a
+            # restart cannot lose it; update_case_status, _write_fired and
+            # mark_notification_sent all stamp last_updated, so any case whose
+            # state was set today is correctly skipped.
+            if str(case.get("last_updated") or "")[:10] == today:
+                skipped += 1
+                continue
             payload = {
                 "notify_at_15": True,
                 "notify_at_10": True,
@@ -1059,7 +1226,8 @@ def reset_daily_flags():
                 json=payload,
                 timeout=15
             )
-        print(f"[INFO] Reset {len(cases)} case flags for new day.")
+        print(f"[INFO] Reset {len(cases) - skipped} case flags for new day "
+              f"({skipped} already touched today, left alone).")
     except requests.RequestException as e:
         print(f"[ERROR] Could not reset daily flags: {e}")
 
