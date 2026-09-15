@@ -883,14 +883,15 @@ def check_notifications(court_data, existing_records):
             # per-case notify_passover_always field is no longer consulted.
             if (akey not in _passover_announced
                     and prefs.get("notify_passover") is not False
-                    and items_away <= PASSOVER_ANNOUNCE_DISTANCE):
+                    and 1 <= items_away <= PASSOVER_ANNOUNCE_DISTANCE):
                 _passover_announced.add(akey)
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
                     notification_type="passover_alert",
-                    message=(f"{items_away} away: {remaining_p} passovers "
-                             f"+ {queue_gap} items. Your item {item_number}."),
+                    message=(f"{items_away} away: "
+                             f"{_breakdown(remaining_p, queue_gap)}. "
+                             f"Your item {item_number}."),
                     now=now,
                     push_title=f"Passovers started \u00b7 Court {court_number}"
                 )
@@ -959,12 +960,15 @@ def check_notifications(court_data, existing_records):
             _write_fired(case_id, case, fired, now)
 
         for threshold in user_thresholds:
-            if items_away <= threshold and threshold not in fired:
+            # 1 <= items_away: zero means the court is AT the item and
+            # negative means it has gone past — both belong to the called
+            # branch, which asks the court rather than the arithmetic.
+            if 1 <= items_away <= threshold and threshold not in fired:
                 # The title carries the distance and the court, so the body
                 # never repeats either — it only says where the court is now
                 # and where the case sits.
                 if remaining_p:
-                    position = (f"{remaining_p} passovers + {queue_gap} items to go. ")
+                    position = f"{_breakdown(remaining_p, queue_gap)} to go. "
                 else:
                     position = f"Now on item {current_item}. "
                 body = f"{position}Your item {item_number}."
@@ -1066,8 +1070,34 @@ def send_push(user_id, notification_type, message, title=None):
         print(f"[PUSH] Send error: {e}")
 
 
+# A negative distance is meaningful INTERNALLY (it drives taken-up detection)
+# but must never reach a human. queue_gap goes negative once the court has moved
+# past the item in the effective queue; since the item-18 change a passed case is
+# no longer dropped from monitoring, so these values now flow on into the alert
+# branches. Guard at the source (the branches below) AND here as a last resort.
+_NONSENSE_RE = re.compile(r"-\d+\s*(?:matter|item|away|passover)", re.I)
+
+
+def _breakdown(remaining_p, queue_gap):
+    """How the distance splits, in words, never rendering a negative.
+    Once queue_gap <= 0 the regular sequence has already passed the item and
+    only the passovers stand between, so the items half is simply dropped."""
+    p = f"{remaining_p} passover{'s' if remaining_p != 1 else ''}"
+    if queue_gap > 0:
+        return f"{p} + {queue_gap} item{'s' if queue_gap != 1 else ''}"
+    return p
+
+
 def log_notification(user_id, case_id, notification_type, message, now,
                      push_title=None):
+    # LAST-RESORT BLOCK. Nothing nonsensical reaches a phone even if a new
+    # code path forgets to guard: no push, no log row, but a loud line so the
+    # offending path is findable in the Railway logs.
+    if _NONSENSE_RE.search(push_title or "") or _NONSENSE_RE.search(message or ""):
+        print(f"[BLOCKED] nonsensical alert suppressed for case {case_id}: "
+              f"type={notification_type} title={push_title!r} msg={message!r}")
+        return
+
     payload = {
         "user_id": user_id,
         "case_id": case_id,
