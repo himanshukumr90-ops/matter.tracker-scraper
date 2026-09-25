@@ -572,9 +572,16 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
     the Urgent block (e.g. 101-150) and the Ordinary block (e.g. 201+) is
     correctly skipped).
 
-    Returns an integer items_away if the queue is known and the user's item
-    is in it; otherwise returns None so the caller can fall back to naive
-    arithmetic.
+    user_item may be a single item or a LIST of the positions the case holds
+    today (a clubbed matter sits at two: the interim application in the urgent
+    block and the parent in the ordinary block).  With several, the distance is
+    to whichever the court reaches FIRST, and once that one has passed it
+    becomes the distance to the next -- which is what makes the case alert at
+    both positions instead of going quiet after the first is missed.
+
+    Returns an integer items_away if the queue is known and at least one of the
+    case's items is in it; otherwise returns None so the caller can fall back
+    to naive arithmetic.
     """
     if court_number not in queue_cache:
         queue_cache[court_number] = get_court_queue(court_number, date_str)
@@ -582,14 +589,27 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
     if not queue:
         return None
 
+    raw_items = user_item if isinstance(user_item, (list, tuple, set)) else [user_item]
+    user_ints = []
+    for v in raw_items:
+        if v is None:
+            continue
+        try:
+            n = int(_norm_item_no(v))
+        except (ValueError, TypeError):
+            continue
+        if n not in user_ints:
+            user_ints.append(n)
     try:
-        user_int = int(_norm_item_no(user_item)) if user_item is not None else None
         current_int = int(_norm_item_no(current_item)) if current_item is not None else 0
     except (ValueError, TypeError):
         return None
 
-    if user_int is None:
+    if not user_ints:
         return None
+    # The operative position (the first the court reaches) stays the anchor for
+    # the fallbacks below, matching the pre-clubbed behaviour exactly.
+    user_int = min(user_ints)
 
     def _distance(q, watch, cur_int):
         """Positional gap from the court's position in q to the nearest
@@ -619,7 +639,15 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
 
     meta = _effective_meta.get((court_number, date_str))
     if meta:
-        watch = positions_to_watch(queue, user_int, meta.get("clubbed"))
+        # Union of every position we know about: the sheet's declared clubbed
+        # partner (positions_to_watch) AND the positions the cause list itself
+        # gives the case. The sheet only knows a pair when it literally prints
+        # "101+203"; the cause list knows them whenever the case is listed
+        # twice, which is the common case and needs no sheet at all.
+        watch = set()
+        for ui in user_ints:
+            watch.update(positions_to_watch(queue, ui, meta.get("clubbed")))
+        watch = sorted(watch)
         if watch and (current_int <= 0 or current_int in queue):
             return _distance(queue, watch, current_int)
         if watch:
@@ -640,9 +668,10 @@ def _compute_items_away(queue_cache, court_number, date_str, current_item, user_
             return _distance(official, [official.index(user_int)], current_int)
         return None
 
-    if user_int not in queue:
+    watch = sorted(queue.index(ui) for ui in user_ints if ui in queue)
+    if not watch:
         return None
-    return _distance(queue, [queue.index(user_int)], current_int)
+    return _distance(queue, watch, current_int)
 
 
 # --- Passover-aware notification state (in-memory; cleared daily in main) ---
@@ -893,6 +922,45 @@ def _canon_case_str(case_type, case_no, case_year):
     return f"{ctype}-{num}-{yr}"
 
 
+def _sr_int(sr_no):
+    """Leading number of a board sr_no. The board decorates them -- "101 V",
+    "101 *", "236 IV" all appear -- so a bare int() would throw and a string
+    compare would miss."""
+    m = re.match(r"\s*(\d+)", str(sr_no or ""))
+    return int(m.group(1)) if m else None
+
+
+def _case_positions_for(court_number, date_str, case, fallback_item=None):
+    """Every item number this case holds in that court today, earliest first.
+
+    A clubbed matter sits at two: the interim application in the urgent block
+    and the parent in the ordinary block, and the court may take it at either
+    (the cause list's own header says motion cases with applications in the
+    urgent list are taken up with them). TrackedCase records only ONE -- the
+    sync keeps the earliest -- so the second position was invisible to the
+    alerts. Measured on the advocate's own 49 cases: 13 double-listed
+    occasions, so this is not an edge case.
+    """
+    me = _canon_case_str(case.get("case_type"), case.get("case_number"),
+                         case.get("case_year"))
+    items = []
+    if me:
+        by_case, _by_position = _cause_list_index(court_number, date_str)
+        for (_lt, item_no) in by_case.get(me, ()):
+            try:
+                n = int(_norm_item_no(item_no))
+            except (ValueError, TypeError):
+                continue
+            if n not in items:
+                items.append(n)
+    if not items and fallback_item is not None:
+        try:
+            items = [int(_norm_item_no(fallback_item))]
+        except (ValueError, TypeError):
+            items = []
+    return sorted(items)
+
+
 def _case_aliases_for(court_number, date_str, case):
     """Every case number the cause list puts at the SAME position as this case.
 
@@ -980,43 +1048,75 @@ def _board_status_for_case(board_cache, court_number, date_str, case):
                           case.get("case_year"))
     if not want:
         return None, None
-    for row in rows:
-        if _norm_case_key(row.get("case_type"), row.get("case_no"),
-                          row.get("case_year")) == want:
-            status = (row.get("hearing_status") or "").strip().upper()
-            return (status or None), row
 
-    # Not on the board under its own number -- read the position instead, via
-    # whatever the cause list co-lists with it (see _case_aliases_for).
+    positions = _case_positions_for(court_number, date_str, case,
+                                    case.get("item_number"))
     aliases = _case_aliases_for(court_number, date_str, case)
-    if not aliases:
-        return None, None
-    found = []
-    for row in rows:
-        key = _canon_case_str(row.get("case_type"), row.get("case_no"),
-                              row.get("case_year"))
-        if key and key in aliases:
-            found.append(((row.get("hearing_status") or "").strip().upper(), row))
-    if not found:
-        return None, None
 
-    # AGGREGATION, and why it is this way round.  A position can hold a large
-    # block (court 10 item 101 carries 26 cause-list rows, 8 of them on the
-    # board with mixed statuses), so a single "Y" among them is NOT evidence
-    # that this advocate's matter was taken up.
-    #   I  -> that group is being heard right now; announce.
-    #   all Y -> the whole group is done; announce.
-    #   any N -> something at this position is still waiting; do not announce,
-    #            and clear a stale flag.  This is the conservative reading and
-    #            it is what makes court 10 come out correct.
+    # READ EACH POSITION SEPARATELY, then combine. A flat scan of the whole
+    # board cannot do this: a clubbed matter taken up at its urgent position
+    # would be masked by its ordinary position still reading "not yet", and
+    # the advocate would be told nothing while the court was hearing him.
+    def _status_at(items):
+        out = []
+        for pos in items:
+            here = []
+            for row in rows:
+                if _sr_int(row.get("sr_no")) != pos:
+                    continue
+                status = (row.get("hearing_status") or "").strip().upper()
+                key = _canon_case_str(row.get("case_type"), row.get("case_no"),
+                                      row.get("case_year"))
+                is_mine = _norm_case_key(row.get("case_type"), row.get("case_no"),
+                                         row.get("case_year")) == want
+                if is_mine or (key and key in aliases):
+                    here.append((status, row))
+            if not here:
+                continue
+            # WITHIN one position, conservatively. A position can hold a large
+            # block -- court 10 item 101 carries 26 cause-list rows, 8 of them
+            # on the board with mixed statuses -- so a single "Y" among other
+            # people's applications is not evidence that this matter was heard.
+            hit = next((r for s, r in here if s == "I"), None)
+            if hit is not None:
+                out.append(("I", hit))
+            elif all(s == "Y" for s, _r in here):
+                out.append(("Y", here[0][1]))
+            else:
+                nrow = next((r for s, r in here if s == "N"), here[0][1])
+                out.append(("N", nrow))
+        return out
+
+    found = _status_at(positions)
+
+    # ACROSS positions, the opposite way round: the matter is heard ONCE, at
+    # whichever position the court reaches first, so one "taken up" settles it.
     for status, row in found:
         if status == "I":
             return "I", row
-    if all(status == "Y" for status, _row in found):
-        return "Y", found[0][1]
     for status, row in found:
-        if status == "N":
-            return "N", row
+        if status == "Y":
+            return "Y", row
+    if found:
+        return "N", found[0][1]
+
+    # The board's own numbering disagrees with the cause list (it happens after
+    # a re-numbering). Fall back to the case's own rows wherever they sit --
+    # collecting ALL of them, because the same case can appear twice with
+    # conflicting statuses and taking whichever came first in the payload made
+    # the answer depend on row order.
+    mine = [((row.get("hearing_status") or "").strip().upper(), row)
+            for row in rows
+            if _norm_case_key(row.get("case_type"), row.get("case_no"),
+                              row.get("case_year")) == want]
+    for status, row in mine:
+        if status == "I":
+            return "I", row
+    for status, row in mine:
+        if status == "Y":
+            return "Y", row
+    if mine:
+        return (mine[0][0] or None), mine[0][1]
     return None, None
 
 
@@ -1097,8 +1197,16 @@ def check_notifications(court_data, existing_records):
         gap_base = current_item
         if is_passover and court.get("last_regular_item"):
             gap_base = court["last_regular_item"]
+        # Every position the case holds today, not just the one the sync
+        # stored: a clubbed matter is taken at whichever the court reaches
+        # first, and if it is NOT pressed at the first one the advocate still
+        # needs warning before the second. Counting to the nearest upcoming
+        # position gives both, because once the first passes the distance
+        # naturally becomes the distance to the next, the consumed thresholds
+        # re-arm on the way out, and the ramp runs again.
+        positions = _case_positions_for(court_number, today, case, item_number)
         queue_gap = _compute_items_away(
-            queue_cache, court_number, today, gap_base, item_number
+            queue_cache, court_number, today, gap_base, positions or item_number
         )
         if queue_gap is None:
             try:
@@ -1241,7 +1349,7 @@ def check_notifications(court_data, existing_records):
                     position = (f"{_passovers_phrase(remaining_p)} pending. ")
                 else:
                     position = f"Now on item {current_item}. "
-                body = f"{position}Your item {item_number}."
+                body = f"{position}Your item {_items_phrase(positions, item_number)}."
                 seq_meta = _effective_meta.get((court_number, today))
                 if seq_meta:
                     body += " Unofficial order."
@@ -1359,6 +1467,18 @@ _NONSENSE_RE = re.compile(r"-\d+\s*(?:matter|item|away|passover)", re.I)
 def _passovers_phrase(remaining_p):
     """"3 passovers" / "1 passover" — the plural the old _breakdown got wrong."""
     return f"{remaining_p} passover{'s' if remaining_p != 1 else ''}"
+
+
+def _items_phrase(positions, item_number):
+    """"210" for the ordinary case, "101 (also listed at 203)" for a matter
+    that sits at two places in the day's list. Naming both matters: the
+    advocate can see which one the court is walking towards, and that the app
+    has not simply picked the wrong number."""
+    items = [p for p in (positions or []) if p is not None]
+    if len(items) < 2:
+        return f"{item_number}"
+    rest = ", ".join(str(p) for p in items[1:])
+    return f"{items[0]} (also listed at {rest})"
 
 
 def _band_for(items_away, thresholds):
