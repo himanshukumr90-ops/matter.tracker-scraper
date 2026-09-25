@@ -324,6 +324,7 @@ def update_court_status(court_data, existing_records):
 # STEP 4 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü CHECK TRACKED CASES AND LOG NOTIFICATIONS
 # ============================================================
 def get_tracked_cases():
+    global _all_tracked_cases
     try:
         response = requests.get(
             f"{BASE44_URL}/TrackedCase",
@@ -332,6 +333,10 @@ def get_tracked_cases():
         )
         response.raise_for_status()
         all_cases = response.json()
+        if isinstance(all_cases, list):
+            # Kept so fill_missing_case_positions() can work from the fetch
+            # this function already makes, rather than adding its own.
+            _all_tracked_cases = all_cases
         today = datetime.date.today().isoformat()
         # NOTE: status is deliberately NOT a filter any more.  It used to be
         # `status == "pending"`, which meant announcing a case removed it from
@@ -350,6 +355,90 @@ def get_tracked_cases():
     except requests.RequestException as e:
         print(f"[ERROR] Could not fetch TrackedCase records: {e}")
         return []
+
+
+# Cases added during a court day used to wait for the 10-minute cause-list
+# sync before check_notifications would look at them at all (it skips any case
+# with a null court_number).  Measured on 2026-09-17: a case added at 09:36 was
+# reached by its court at 10:13 and the FIRST thing the advocate heard was
+# "called" at 11:01 -- the wait is not bounded by the sync interval, because
+# the sync also has to be the run that happens to see the case.  This fills the
+# position straight from the cause list already held in memory.
+_all_tracked_cases = []
+_last_fill_time = None
+FILL_INTERVAL_SECONDS = 120
+
+
+def fill_missing_case_positions():
+    """Give today's newly added cases their court/item now, not in 10 minutes.
+
+    Only ever writes when the fields are EMPTY, so it cannot fight
+    sync_tracked_cases_from_cause_list, which remains the general mechanism
+    (it also moves cases between dates and courts as better lists arrive).
+    """
+    today = datetime.date.today().isoformat()
+    candidates = [
+        c for c in _all_tracked_cases
+        if (c.get("court_number") is None or c.get("item_number") is None)
+        and c.get("notifications_enabled", True)
+        and c.get("case_date") in (today, None, "")
+    ]
+    if not candidates:
+        return
+    _load_cause_list_cache()
+
+    # Same preference the sync uses, so a case filled here and a case filled by
+    # the sync land on the same position: COMPLETE beats URGENT beats ORDINARY,
+    # then the earliest item -- the first place the court reaches it.
+    priority = {"COMPLETE": 0, "URGENT": 1, "ORDINARY": 2}
+    by_case = {}
+    for (ld, lt, cn, court_no, item_no) in _cause_list_keys:
+        if ld != today:
+            continue
+        key = str(cn or "").strip().upper()
+        try:
+            item_int = int(_norm_item_no(item_no))
+        except (ValueError, TypeError):
+            continue
+        rank = (priority.get(lt, 9), item_int)
+        if key not in by_case or rank < by_case[key][0]:
+            by_case[key] = (rank, court_no, item_int)
+
+    filled = 0
+    for case in candidates:
+        want = _canon_case_str(case.get("case_type"), case.get("case_number"),
+                               case.get("case_year"))
+        hit = by_case.get(want) if want else None
+        if not hit:
+            continue
+        _rank, court_no, item_int = hit
+        payload = {"court_number": court_no, "item_number": item_int,
+                   "case_date": today}
+        try:
+            r = requests.put(f"{BASE44_URL}/TrackedCase/{case.get('id')}",
+                             headers=HEADERS, json=payload, timeout=15)
+            if r.status_code == 200:
+                case.update(payload)
+                filled += 1
+            else:
+                print(f"[FILL] {want}: HTTP {r.status_code}")
+        except requests.RequestException as e:
+            print(f"[FILL] {want}: {e}")
+    if filled:
+        print(f"[FILL] Gave {filled} newly added case(s) today's court/item")
+
+
+def maybe_fill_case_positions():
+    """Rate-limited wrapper — at most once every FILL_INTERVAL_SECONDS."""
+    global _last_fill_time
+    now = time.time()
+    if _last_fill_time is not None and (now - _last_fill_time) < FILL_INTERVAL_SECONDS:
+        return
+    _last_fill_time = now
+    try:
+        fill_missing_case_positions()
+    except Exception as e:
+        print(f"[FILL] Unexpected error: {e}")
 
 
 def _official_court_queue(court_number, date_str):
@@ -787,10 +876,101 @@ def _fetch_board_details(court_number, date_str):
     return rows
 
 
+def _canon_case_str(case_type, case_no, case_year):
+    """One spelling for a case, whatever shape it arrives in.
+
+    The cause list stores the composite ("CM-6529-LPA-2026"), the board sends
+    it split as case_type="CM" / case_no="6529-LPA" / case_year=2026, and
+    TrackedCase splits it differently again ("LPA" / "1095" / 2022).  Joining
+    type-no-year with hyphens reproduces the composite in every case, which is
+    what lets a board row be looked up in _cause_list_keys.
+    """
+    ctype = str(case_type or "").strip().upper()
+    num = _norm_item_no(case_no).upper()
+    yr = _norm_item_no(case_year)
+    if not ctype or not num or not yr:
+        return None
+    return f"{ctype}-{num}-{yr}"
+
+
+def _case_aliases_for(court_number, date_str, case):
+    """Every case number the cause list puts at the SAME position as this case.
+
+    THE PROBLEM THIS SOLVES (measured 2026-09-25): the display board very often
+    carries only the APPLICATION that brought a matter into the list, never the
+    matter the advocate tracks -- court 48 item 119 shows "CRM-40415-2026" where
+    the cause list has both CRM-40415 and the tracked "CRR-2300-2026"; court 66
+    item 109 shows "CRM-39898" for tracked "CRM-M-33173-2026"; court 10 item 101
+    shows a block of CMs for a tracked LPA.  Looking the case up by its own
+    number therefore fails, `_board_status_for_case` returns None, and the
+    called-decision silently falls back to the item arithmetic that produced the
+    false "your case is up" alerts.
+
+    Everything needed is already in memory: `_cause_list_keys` holds
+    (date, list_type, case_number, court, item), so the case's positions for
+    today give the numbers co-listed with it.  No extra HTTP, no schema change.
+    """
+    me = _canon_case_str(case.get("case_type"), case.get("case_number"),
+                         case.get("case_year"))
+    if not me:
+        return set()
+    by_case, by_position = _cause_list_index(court_number, date_str)
+    aliases = set()
+    for pos in by_case.get(me, ()):
+        aliases |= by_position.get(pos, set())
+    aliases.discard(me)
+    return aliases
+
+
+# _cause_list_keys spans today..+13 days across every court and list type, so it
+# reaches six figures; scanning it per case per 30-second cycle would be pure
+# waste. Index it once per (court, date) instead.
+#
+# INVALIDATION: _cause_list_keys is only ever ADDED to (two call sites, no
+# remove/clear), so a change in its size is a sound dirty check. If a future
+# change ever removes keys, call _invalidate_cause_list_index() there too --
+# otherwise a stale index would quietly answer with yesterday's co-listings.
+_cl_index = {}
+_cl_index_size = -1
+
+
+def _invalidate_cause_list_index():
+    global _cl_index, _cl_index_size
+    _cl_index = {}
+    _cl_index_size = -1
+
+
+def _cause_list_index(court_number, date_str):
+    """(case_number -> {(list_type, item)}, (list_type, item) -> {case_number})
+    for one court on one date."""
+    global _cl_index, _cl_index_size
+    _load_cause_list_cache()
+    if len(_cause_list_keys) != _cl_index_size:
+        _cl_index = {}
+        _cl_index_size = len(_cause_list_keys)
+    hit = _cl_index.get((court_number, date_str))
+    if hit is not None:
+        return hit
+
+    by_case, by_position = {}, {}
+    for (ld, lt, cn, court_no, item_no) in _cause_list_keys:
+        if ld != date_str or court_no != court_number:
+            continue
+        key = str(cn or "").strip().upper()
+        if not key:
+            continue
+        pos = (lt, _norm_item_no(item_no))
+        by_case.setdefault(key, set()).add(pos)
+        by_position.setdefault(pos, set()).add(key)
+    _cl_index[(court_number, date_str)] = (by_case, by_position)
+    return by_case, by_position
+
+
 def _board_status_for_case(board_cache, court_number, date_str, case):
     """('I'|'Y'|'N', row) for this case on that court's board, or (None, None)
-    when there is no trustworthy answer -- board unavailable, or the case is
-    not on it.  Cached per court for the life of one cycle."""
+    when there is no trustworthy answer -- board unavailable, or neither the
+    case nor anything co-listed with it is on the board.  Cached per court for
+    the life of one cycle."""
     if court_number not in board_cache:
         board_cache[court_number] = _fetch_board_details(court_number, date_str)
     rows = board_cache[court_number]
@@ -805,6 +985,38 @@ def _board_status_for_case(board_cache, court_number, date_str, case):
                           row.get("case_year")) == want:
             status = (row.get("hearing_status") or "").strip().upper()
             return (status or None), row
+
+    # Not on the board under its own number -- read the position instead, via
+    # whatever the cause list co-lists with it (see _case_aliases_for).
+    aliases = _case_aliases_for(court_number, date_str, case)
+    if not aliases:
+        return None, None
+    found = []
+    for row in rows:
+        key = _canon_case_str(row.get("case_type"), row.get("case_no"),
+                              row.get("case_year"))
+        if key and key in aliases:
+            found.append(((row.get("hearing_status") or "").strip().upper(), row))
+    if not found:
+        return None, None
+
+    # AGGREGATION, and why it is this way round.  A position can hold a large
+    # block (court 10 item 101 carries 26 cause-list rows, 8 of them on the
+    # board with mixed statuses), so a single "Y" among them is NOT evidence
+    # that this advocate's matter was taken up.
+    #   I  -> that group is being heard right now; announce.
+    #   all Y -> the whole group is done; announce.
+    #   any N -> something at this position is still waiting; do not announce,
+    #            and clear a stale flag.  This is the conservative reading and
+    #            it is what makes court 10 come out correct.
+    for status, row in found:
+        if status == "I":
+            return "I", row
+    if all(status == "Y" for status, _row in found):
+        return "Y", found[0][1]
+    for status, row in found:
+        if status == "N":
+            return "N", row
     return None, None
 
 
@@ -853,6 +1065,29 @@ def check_notifications(court_data, existing_records):
         is_passover = court["is_passover"]
         remaining_p = _remaining_passovers(court)
 
+        # The display board reads 0 both before a court sits and after it
+        # rises.  Before, that is useful (the distance is simply the item's
+        # place in the queue).  After, it is noise -- on 2026-09-17 court 61
+        # sent "Now on item 0. Your item 104." at 17:33, long after rising.
+        # Two signals separate the two, because _last_queue_item is in-memory
+        # and a mid-day redeploy would otherwise make a risen court look like
+        # a morning one: anything already taken up on that court's board says
+        # the day has started.
+        #
+        # This suppresses the DISTANCE alerts only.  The called decision below
+        # still runs, so a matter that turned Y while the scraper was down is
+        # still announced once the court has risen.
+        court_risen = False
+        if not current_item:
+            if court_number not in board_cache:
+                board_cache[court_number] = _fetch_board_details(
+                    court_number, today)
+            _rows = board_cache[court_number] or []
+            court_risen = bool(
+                _last_queue_item.get(court_number)
+                or any((r.get("hearing_status") or "").strip().upper()
+                       in ("Y", "I") for r in _rows))
+
         # Queue-aware gap from the court's position to the user's item
         # (skips the Urgent->Ordinary numbering gap). During a passover the
         # board shows the passed-over matter, NOT where the regular
@@ -871,9 +1106,15 @@ def check_notifications(court_data, existing_records):
             except (ValueError, TypeError):
                 continue
 
-        # Effective distance counts pending passovers: the court works
-        # through the passover queue before resuming regular items.
-        items_away = queue_gap + remaining_p
+        # PASSOVERS ARE REPORTED, NOT ADDED (changed 2026-09-25).  The old
+        # `items_away = queue_gap + remaining_p` assumed the court clears every
+        # pending passover before resuming the list.  Measured over the trial:
+        # in 4 of the 13 checkable passover alerts it did not, and the distance
+        # was overstated by 4-10 -- the dangerous direction, since the advocate
+        # believes he has more time.  Counting only the list positions errs the
+        # safe way (he is told sooner), and the passovers are still named in
+        # the body so he knows what stands in front of him.
+        items_away = queue_gap
 
         # --- One announcement per passover episode per case ---
         if is_passover:
@@ -882,16 +1123,20 @@ def check_notifications(court_data, existing_records):
             # Passover alerts are now a single global user setting; the old
             # per-case notify_passover_always field is no longer consulted.
             if (akey not in _passover_announced
+                    and not court_risen
                     and prefs.get("notify_passover") is not False
                     and 1 <= items_away <= PASSOVER_ANNOUNCE_DISTANCE):
                 _passover_announced.add(akey)
+                _pband = _band_for(items_away,
+                                   _sanitise_thresholds(
+                                       prefs.get("notification_thresholds")))
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
                     notification_type="passover_alert",
-                    message=(f"{items_away} away: "
-                             f"{_breakdown(remaining_p, queue_gap)}. "
-                             f"Your item {item_number}."),
+                    message=(f"{_passovers_phrase(remaining_p)} pending. "
+                             f"Your item {item_number} is "
+                             f"{_distance_phrase(_pband)}."),
                     now=now,
                     push_title=f"Passovers started \u00b7 Court {court_number}"
                 )
@@ -905,15 +1150,20 @@ def check_notifications(court_data, existing_records):
             board_cache, court_number, today, case)
         already_announced = case.get("status") == "called"
 
-        def _announce_called():
+        def _announce_called(confirmed=True):
                 update_case_status(case_id, "called", now)
+                # "reached" covers both cases honestly: the board may be ON the
+                # item or may have just passed it.  When the court's own record
+                # could not be read, say so rather than implying it was.
+                body = (f"Item {item_number} has been reached." if confirmed
+                        else (f"Item {item_number} appears to have been "
+                              f"reached. Not yet confirmed by the court's "
+                              f"board."))
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
                     notification_type="case_called",
-                    # "reached" covers both cases honestly: the board may be ON the
-                    # item or may have just passed it.
-                    message=f"Item {item_number} has been reached.",
+                    message=body,
                     now=now,
                     push_title=f"Your case is up \u00b7 Court {court_number}"
                 )
@@ -938,14 +1188,34 @@ def check_notifications(court_data, existing_records):
             continue
         elif items_away <= 0:
             # No trustworthy board answer -- the court list was unavailable, or
-            # this case is not on it.  Fall back to the item arithmetic, the
-            # path that produced false calls before the per-case status
-            # existed, so say so in the log.  Withholding the alert would risk
-            # a missed hearing, and a wrong one no longer blinds us.
+            # neither this case nor anything co-listed with it is on it.  This
+            # is the arithmetic path that produced every false "your case is
+            # up" in the 2026-09-25 analysis (court 46 item 230 announced at
+            # 14:03 for a matter really reached at 15:57; court 44 item 231
+            # announced for a matter never called at all).
+            #
+            # THE DISCRIMINATOR IS THE APPROACH RAMP.  A court walking up to an
+            # item always crosses the thresholds first, so a genuine call has
+            # alerts behind it.  A bare case_called with no ramp was the
+            # signature of every false one -- it means the board jumped past
+            # the item, which on an out-of-order court says nothing about
+            # whether this matter was taken up.
             if not already_announced:
-                print(f"[BOARD] case {case_id}: no board confirmation for court "
-                      f"{court_number}; announcing on distance alone")
-                _announce_called()
+                if _fired_thresholds(case):
+                    print(f"[BOARD] case {case_id}: no board confirmation for "
+                          f"court {court_number}; announcing on distance after "
+                          f"an approach ramp")
+                    _announce_called(confirmed=False)
+                else:
+                    print(f"[BOARD] case {case_id}: no board confirmation and "
+                          f"no approach ramp for court {court_number}; "
+                          f"withholding called (item {item_number}, board "
+                          f"{current_item})")
+            continue
+
+        if court_risen:
+            # Board is back to the 0 sentinel for the day; there is no live
+            # position to count from, so no distance alert can be honest.
             continue
 
         user_thresholds = _sanitise_thresholds(prefs.get("notification_thresholds"))
@@ -964,11 +1234,11 @@ def check_notifications(court_data, existing_records):
             # negative means it has gone past — both belong to the called
             # branch, which asks the court rather than the arithmetic.
             if 1 <= items_away <= threshold and threshold not in fired:
-                # The title carries the distance and the court, so the body
-                # never repeats either — it only says where the court is now
-                # and where the case sits.
+                # The title carries the distance BAND and the court, so the
+                # body never repeats either — it only says where the court is
+                # now and where the case sits.
                 if remaining_p:
-                    position = f"{_breakdown(remaining_p, queue_gap)} to go. "
+                    position = (f"{_passovers_phrase(remaining_p)} pending. ")
                 else:
                     position = f"Now on item {current_item}. "
                 body = f"{position}Your item {item_number}."
@@ -982,14 +1252,22 @@ def check_notifications(court_data, existing_records):
                         item_tags = []
                     if item_tags:
                         body += f" {'; '.join(item_tags).capitalize()}."
-                plural = "s" if items_away != 1 else ""
+                # BANDS, NOT A PINPOINT NUMBER (operator decision 2026-09-25).
+                # We counted every listed item between the court and the
+                # advocate, but courts skip matters constantly -- measured over
+                # the trial, when our number was wrong the court was CLOSER
+                # than we said nine times in ten.  "13 matters away" was
+                # therefore a promise we could not keep, while "less than 15"
+                # is true whenever the count is 15 or fewer.  The band is the
+                # tightest one the user's own thresholds allow.
+                band = _band_for(items_away, user_thresholds) or threshold
                 log_notification(
                     user_id=user_id,
                     case_id=case_id,
                     notification_type=f"{threshold}_away",
                     message=body,
                     now=now,
-                    push_title=(f"{items_away} matter{plural} away "
+                    push_title=(f"{_distance_phrase(band).capitalize()} "
                                 f"\u00b7 Court {court_number}")
                 )
                 # Consume EVERY threshold the case has already passed, not
@@ -1078,14 +1356,34 @@ def send_push(user_id, notification_type, message, title=None):
 _NONSENSE_RE = re.compile(r"-\d+\s*(?:matter|item|away|passover)", re.I)
 
 
-def _breakdown(remaining_p, queue_gap):
-    """How the distance splits, in words, never rendering a negative.
-    Once queue_gap <= 0 the regular sequence has already passed the item and
-    only the passovers stand between, so the items half is simply dropped."""
-    p = f"{remaining_p} passover{'s' if remaining_p != 1 else ''}"
-    if queue_gap > 0:
-        return f"{p} + {queue_gap} item{'s' if queue_gap != 1 else ''}"
-    return p
+def _passovers_phrase(remaining_p):
+    """"3 passovers" / "1 passover" — the plural the old _breakdown got wrong."""
+    return f"{remaining_p} passover{'s' if remaining_p != 1 else ''}"
+
+
+def _band_for(items_away, thresholds):
+    """The tightest band the user's own thresholds can express for a distance.
+
+    Thresholds 15/10/5 with a distance of 3 gives 5, i.e. "less than 5 matters
+    away" — true, and the most informative thing we can honestly say.  None
+    when the distance is beyond every threshold the user chose.
+    """
+    candidates = [t for t in (thresholds or []) if t >= items_away]
+    return min(candidates) if candidates else None
+
+
+def _distance_phrase(band):
+    """The distance in words. Reads correctly as a push TITLE (capitalised) and
+    mid-sentence in a body, which is why there is no bare number in it.
+
+    "less than 1 matters away" would be nonsense, so a band of 1 becomes
+    "next in the list" — the same fact, said the way a person would say it.
+    """
+    if not band:
+        return "still ahead in the list"
+    if band <= 1:
+        return "next in the list"
+    return f"less than {band} matters away"
 
 
 def log_notification(user_id, case_id, notification_type, message, now,
@@ -2541,6 +2839,7 @@ def main():
                 _court_passover_state.clear()
                 _last_regular_item.clear()
                 _last_queue_item.clear()
+                _invalidate_cause_list_index()
                 last_run_date = current_date
 
             # --- SCRAPE DISPLAY BOARD ---
@@ -2553,6 +2852,9 @@ def main():
             _update_last_regular(court_data)
             existing_records = get_existing_court_records()
             update_court_status(court_data, existing_records)
+            # Before the notification pass, so a case added minutes ago is
+            # already carrying today's court/item when it is evaluated.
+            maybe_fill_case_positions()
             check_notifications(court_data, existing_records)
 
             # --- SCRAPE CAUSE LISTS (once per cycle) ---
