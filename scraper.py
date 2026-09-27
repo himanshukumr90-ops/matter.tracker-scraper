@@ -16,6 +16,7 @@ import time
 import re
 from datetime import timedelta, timezone
 
+import supabase_mirror
 from unofficial_sequence import (
     build_effective_queue, positions_to_watch, extract_case_type)
 
@@ -296,6 +297,7 @@ def update_court_status(court_data, existing_records):
             "last_updated": now,
             "is_active": True
         }
+        supabase_mirror.mirror_court_status(court_number, data, today, now)
         try:
             if court_number in existing_records:
                 record_id = existing_records[court_number]
@@ -1523,6 +1525,8 @@ def log_notification(user_id, case_id, notification_type, message, now,
         "message": message,
         "sent_at": now
     }
+    supabase_mirror.mirror_notification(user_id, case_id, notification_type,
+                                       message, now)
     try:
         r = requests.post(
             f"{BASE44_URL}/NotificationLog",
@@ -2036,6 +2040,7 @@ def store_cause_list_entries(entries):
             entry.get("court_number"),
             _norm_item_no(entry.get("item_number")),
         )
+        supabase_mirror.mirror_cause_list(entry)
         if key in _cause_list_keys:
             skipped += 1
             continue
@@ -2944,6 +2949,14 @@ def main():
         start_roster_parser()
     except Exception as e:
         print(f"[ROSTER] Parser startup error: {e}")
+
+    # Shadow-copy writes into Supabase for the migration comparison.
+    # Inert unless SUPABASE_URL + SUPABASE_SERVICE_KEY are set; never blocks
+    # this loop and never raises into it.
+    try:
+        supabase_mirror.start()
+    except Exception as e:
+        print(f"[MIRROR] startup error (ignored): {e}")
 
     last_run_date = None
     _seed_last_regular_from_db()
