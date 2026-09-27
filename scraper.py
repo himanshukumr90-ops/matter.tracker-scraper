@@ -253,6 +253,49 @@ def get_existing_court_records():
 # ============================================================
 # STEP 3 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü WRITE COURT DATA TO BASE44
 # ============================================================
+# ── Write court status only when it has actually changed ───────────────────
+# MEASURED 2026-09-28 01:09-01:14: cycles were completing 50-60s apart, i.e.
+# 20-30s of WORK on top of the 30s sleep, at one in the morning with no court
+# sitting. The work was this function marking all 67 courts inactive, one
+# request at a time, every cycle -- roughly 1,600 writes between midnight and
+# dawn all saying what the previous one said. Base44 had begun refusing them
+# ("Rate limit exceeded" on courts 11/31/33/35/53/64/65 at 00:51).
+#
+# The cost is not the refusals; it is that a bloated cycle means the display
+# board is read every 55 seconds rather than every 30, which is a slower alert
+# for everyone. This also removes the load that would double the day a second
+# High Court is added.
+#
+# THE HEARTBEAT IS NOT OPTIONAL. The app's "Live" indicator calls the data
+# stale when the newest last_updated is over 5 minutes old (see the frontend's
+# LiveIndicator, shipped 2026-09-13). If we simply stopped writing unchanged
+# rows, every court would look stale within five minutes and the indicator
+# would start lying in the opposite direction. So an unchanged court is still
+# written every COURT_HEARTBEAT_SECONDS.
+COURT_HEARTBEAT_SECONDS = 120
+
+# court_number -> (payload_signature, epoch_of_last_write)
+_court_last_write = {}
+
+
+def _court_write_needed(court_number, signature, now_epoch=None):
+    """True when this court must be written: the values changed, or the
+    heartbeat is due, or we have never written it in this process."""
+    now_epoch = now_epoch if now_epoch is not None else time.time()
+    prev = _court_last_write.get(court_number)
+    if prev is None:
+        return True
+    prev_sig, prev_at = prev
+    if prev_sig != signature:
+        return True
+    return (now_epoch - prev_at) >= COURT_HEARTBEAT_SECONDS
+
+
+def _court_write_done(court_number, signature, now_epoch=None):
+    _court_last_write[court_number] = (
+        signature, now_epoch if now_epoch is not None else time.time())
+
+
 def update_court_status(court_data, existing_records):
     # Fetch failed this cycle (get_existing_court_records returned None).
     # Skip ALL writes — re-POSTing every court against a missing map is
@@ -268,7 +311,14 @@ def update_court_status(court_data, existing_records):
     is_session_active = len(court_data) > 0
 
     if not is_session_active:
+        written = skipped = 0
         for court_number, record_id in existing_records.items():
+            # "Not sitting" does not change from one cycle to the next. Write
+            # it once, then only on the heartbeat.
+            sig = ("inactive",)
+            if not _court_write_needed(court_number, sig):
+                skipped += 1
+                continue
             payload = {"is_active": False, "last_updated": now}
             try:
                 r = requests.put(
@@ -279,11 +329,16 @@ def update_court_status(court_data, existing_records):
                 )
                 if r.status_code != 200:
                     print(f"[WARN] Could not mark court {court_number} inactive: {r.text}")
+                else:
+                    written += 1
+                    _court_write_done(court_number, ("inactive",))
             except requests.RequestException as e:
                 print(f"[ERROR] Court {court_number} inactive update failed: {e}")
-        print("[INFO] All courts marked as inactive (not in session).")
+        print(f"[INFO] Courts not in session — wrote {written}, "
+              f"skipped {skipped} unchanged.")
         return
 
+    written = skipped = 0
     for court_number, data in court_data.items():
         payload = {
             "court_number": court_number,
@@ -297,6 +352,15 @@ def update_court_status(court_data, existing_records):
             "last_updated": now,
             "is_active": True
         }
+        # Everything the app renders, EXCEPT last_updated -- which changes
+        # every cycle by definition and would defeat the whole check.
+        sig = (data["current_item"], data["is_passover"],
+               data["passover_current"], data["passover_total"],
+               data.get("last_regular_item"), data.get("last_queue_item"),
+               today, True)
+        if not _court_write_needed(court_number, sig):
+            skipped += 1
+            continue
         supabase_mirror.mirror_court_status(court_number, data, today, now)
         try:
             if court_number in existing_records:
@@ -316,10 +380,14 @@ def update_court_status(court_data, existing_records):
                 )
             if r.status_code != 200:
                 print(f"[WARN] Court {court_number} write failed: {r.status_code} {r.text}")
+            else:
+                written += 1
+                _court_write_done(court_number, sig)
         except requests.RequestException as e:
             print(f"[ERROR] Court {court_number} write error: {e}")
 
-    print(f"[INFO] Updated {len(court_data)} court records in Base44.")
+    print(f"[INFO] Court status — wrote {written}, skipped {skipped} unchanged "
+          f"(of {len(court_data)} on the board).")
 
 
 # ============================================================
@@ -3048,8 +3116,20 @@ def main():
                 _court_passover_state.clear()
                 _last_regular_item.clear()
                 _last_queue_item.clear()
+                _court_last_write.clear()
                 _invalidate_cause_list_index()
                 last_run_date = current_date
+
+            # Per-phase timing. Without it, success is silent and the only
+            # evidence of a stalled loop is a gap between "Cycle complete"
+            # lines -- which is how six-minute alert blackouts went unnoticed.
+            _t = {}
+            _mark = time.time()
+
+            def _phase(name):
+                nonlocal _mark
+                _t[name] = round(time.time() - _mark, 1)
+                _mark = time.time()
 
             # --- SCRAPE DISPLAY BOARD ---
             court_data = scrape_display_board()
@@ -3057,24 +3137,30 @@ def main():
                 print("[WARN] Scrape failed, retrying in 30 seconds...")
                 time.sleep(SCRAPE_INTERVAL)
                 continue
+            _phase("board")
 
             _update_last_regular(court_data)
             existing_records = get_existing_court_records()
+            _phase("read")
             update_court_status(court_data, existing_records)
+            _phase("write")
             # Before the notification pass, so a case added minutes ago is
             # already carrying today's court/item when it is evaluated.
             maybe_fill_case_positions()
             check_notifications(court_data, existing_records)
+            _phase("alerts")
 
             # --- SCRAPE CAUSE LISTS (once per cycle) ---
             try:
                 scrape_cause_lists()
+                _phase("causelist")
             except Exception as e:
                 print(f"[CAUSELIST] Unexpected error: {e}")
 
             # --- SCRAPE COMPLETE LIST from old PHHC site (rate-limited, ~15min per date) ---
             try:
                 scrape_complete_lists()
+                _phase("complete")
             except Exception as e:
                 print(f"[COMPLETE] Unexpected error: {e}")
 
@@ -3084,16 +3170,21 @@ def main():
             # website).
             try:
                 maybe_refresh_tracked_cases_from_website()
+                _phase("webrefresh")
             except Exception as e:
                 print(f"[WEBREFRESH] Unexpected error: {e}")
 
             # --- SYNC TRACKED CASE DATES FROM CAUSE LIST (rate-limited) ---
             try:
                 maybe_sync_tracked_cases()
+                _phase("sync")
             except Exception as e:
                 print(f"[SYNC] Unexpected error: {e}")
 
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Cycle complete. "
+            _total = round(sum(_t.values()), 1)
+            _slow = " ".join(f"{k}={v}s" for k, v in _t.items() if v >= 0.5)
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Cycle complete "
+                  f"in {_total}s{(' — ' + _slow) if _slow else ''}. "
                   f"Waiting {SCRAPE_INTERVAL}s...")
 
         except Exception as e:
