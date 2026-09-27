@@ -2069,6 +2069,76 @@ def store_cause_list_entries(entries):
     return stored
 
 
+# ── Heavy background work is kept out of sitting hours ──────────────────────
+# MEASURED 2026-09-25 14:06:28-14:12:42: a dirty cause-list sweep re-fetched
+# all 62 benches to recover the 2 that had failed, and check_notifications
+# could not run for 6 minutes 14 seconds -- on a sitting day, with 8 courts
+# active. It then stored NOTHING ("skipped 1514 dupes"): it re-downloaded data
+# we already had. Because benches failed again it re-armed for 30 minutes
+# later. The cause-list sweep is not the only offender:
+# refresh_tracked_cases_from_website walks all ~522 tracked cases with a 0.3s
+# pause and a lookup each -- three to seven minutes, every six hours, so one
+# or two of its four daily runs land mid-court-day by simple arithmetic.
+#
+# None of this work is needed while courts sit. Cause lists are published
+# ahead of the date; the Complete List arrives overnight; next-hearing dates
+# are better collected in one pass after the day's adjournments than half-way
+# through them. So it waits.
+#
+# THE SAFETY VALVE MATTERS MORE THAN THE PAUSE. If today's cause list is
+# missing -- an overnight sweep that failed -- the queue cannot be built,
+# _compute_items_away falls back to naive subtraction, and that is precisely
+# the path that produced the false "your case is up" alerts of 2026-09-25.
+# Being paused is good; being blind is not. So a court day with no list for
+# today fetches anyway.
+SITTING_START_MIN = 9 * 60 + 45      # 09:45 IST, courts rise ~10:00
+SITTING_END_MIN = 16 * 60 + 30       # 16:30 IST, courts rise ~16:00
+
+
+def _in_sitting_hours(now_ist=None):
+    """True during the window when the alert loop must not be blocked."""
+    now_ist = now_ist or datetime.datetime.now(IST)
+    if now_ist.weekday() >= 5:               # Sat/Sun: no sitting
+        return False
+    minutes = now_ist.hour * 60 + now_ist.minute
+    return SITTING_START_MIN <= minutes < SITTING_END_MIN
+
+
+def _have_todays_cause_list():
+    """Do we hold ANY cause-list rows for today? Read from the in-memory key
+    set, so this costs nothing and cannot itself block the loop."""
+    today = datetime.date.today().isoformat()
+    for (ld, _lt, _cn, _court, _item) in _cause_list_keys:
+        if ld == today:
+            return True
+    return False
+
+
+_deferred_logged = None
+
+
+def _defer_heavy_work(label):
+    """True when `label` should wait until courts rise. Logs the decision once
+    per transition so the deferral is visible in the logs rather than looking
+    like the job silently stopped running."""
+    global _deferred_logged
+    if not _in_sitting_hours():
+        if _deferred_logged is not None:
+            print("[SCHEDULE] Court hours over -- background work resumes.")
+            _deferred_logged = None
+        return False
+    if not _have_todays_cause_list():
+        print(f"[SCHEDULE] {label}: in sitting hours BUT no cause list held "
+              f"for today -- fetching anyway (a missing list is worse than a "
+              f"blocked loop).")
+        return False
+    if _deferred_logged != label:
+        print(f"[SCHEDULE] {label}: deferred until 16:30 IST so the "
+              f"notification loop is not blocked while courts sit.")
+        _deferred_logged = label
+    return True
+
+
 def scrape_cause_lists():
     """
     Main cause list function. Uses the PHHC JSON API via the bom1 relay ‚Äö√Ñ√∂‚àö√ë‚àö√Ü
@@ -2078,6 +2148,8 @@ def scrape_cause_lists():
     - ORDINARY lists are published ~2 days before the hearing date
     - URGENT lists are published ~1 day before the hearing date
     """
+    if _defer_heavy_work("cause-list sweep"):
+        return
     print("[CAUSELIST] Starting cause list check...")
     now_ist = datetime.datetime.now(IST)
 
@@ -2525,6 +2597,8 @@ def refresh_tracked_cases_from_website():
 
 def maybe_refresh_tracked_cases_from_website():
     """Rate-limited: runs at most once every WEBSITE_REFRESH_INTERVAL_SECONDS."""
+    if _defer_heavy_work("tracked-case website refresh"):
+        return
     global _last_website_refresh_time
     now = time.time()
     if (_last_website_refresh_time is not None
@@ -2880,6 +2954,8 @@ def scrape_complete_lists():
     Rate-limited: at most one poll per (date) per
     COMPLETE_LIST_POLL_INTERVAL_SECONDS.
     """
+    if _defer_heavy_work("Complete List download"):
+        return
     global _last_complete_poll
     now_ist = datetime.datetime.now(IST)
     dates_to_check = [
