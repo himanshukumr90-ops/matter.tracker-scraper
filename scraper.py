@@ -393,20 +393,79 @@ def update_court_status(court_data, existing_records):
 # ============================================================
 # STEP 4 ‚Äö√Ñ√∂‚àö√ë‚àö√Ü CHECK TRACKED CASES AND LOG NOTIFICATIONS
 # ============================================================
+# ── Read every TrackedCase, not just the first page ────────────────────────
+# Four call sites asked Base44 for "all TrackedCase" with no limit and no
+# paging. A single unfiltered GET silently caps -- the same cap that, on
+# CauseListEntry, left the dedup index missing recent dates after every
+# restart until _fetch_cause_list_rows was written for it in June.
+#
+# WHAT IT COSTS WHEN IT BITES: the cases past the cut-off are simply absent
+# from the list, so check_notifications never evaluates them. No error, no
+# warning, nothing visibly broken -- an advocate just never hears about his
+# matter. It is harmless at today's ~522 rows and becomes a silent outage
+# exactly when user growth succeeds, which is the worst possible timing.
+#
+# ⚠️ THIS IS NEEDED ON SUPABASE TOO, not just Base44: PostgREST caps a
+# response at 1,000 rows by default. Measured 2026-09-26, a limit=10000 read
+# returned exactly 1000 and briefly looked like 7,875 rows had vanished.
+#
+# RETURNS None ON ANY FAILURE, NEVER A PARTIAL LIST. A short page caused by a
+# 429 is indistinguishable from the end of the data, and treating it as the
+# end is precisely how cases would go unmonitored while everything looked
+# healthy. Callers must decide what to do with None; none of them may treat
+# it as "there are no cases".
+TRACKED_PAGE = 500
+
+
+def _fetch_tracked_cases(filter_params=None):
+    """All TrackedCase rows matching filter_params, or None if the read failed."""
+    rows, skip = [], 0
+    base = dict(filter_params or {})
+    while True:
+        try:
+            r = requests.get(
+                f"{BASE44_URL}/TrackedCase",
+                params={**base, "limit": TRACKED_PAGE, "skip": skip},
+                headers=HEADERS,
+                timeout=20,
+            )
+            if r.status_code != 200:
+                print(f"[TRACKED] HTTP {r.status_code} at skip={skip} — treating "
+                      f"as FAILURE, not as end of data ({len(rows)} read so far)")
+                return None
+            batch = r.json()
+        except (requests.RequestException, ValueError) as e:
+            print(f"[TRACKED] {type(e).__name__} at skip={skip}: {e} — treating "
+                  f"as FAILURE, not as end of data")
+            return None
+        if not isinstance(batch, list):
+            print(f"[TRACKED] unexpected payload at skip={skip} — treating as failure")
+            return None
+        rows.extend(batch)
+        if len(batch) < TRACKED_PAGE:
+            return rows
+        skip += TRACKED_PAGE
+        if skip >= 100000:
+            print("[TRACKED] refusing to page past 100,000 rows; something is wrong")
+            return rows
+        time.sleep(0.1)          # be gentle with Base44 between pages
+
+
 def get_tracked_cases():
     global _all_tracked_cases
     try:
-        response = requests.get(
-            f"{BASE44_URL}/TrackedCase",
-            headers=HEADERS,
-            timeout=15
-        )
-        response.raise_for_status()
-        all_cases = response.json()
-        if isinstance(all_cases, list):
-            # Kept so fill_missing_case_positions() can work from the fetch
-            # this function already makes, rather than adding its own.
-            _all_tracked_cases = all_cases
+        all_cases = _fetch_tracked_cases()
+        if all_cases is None:
+            # A failed read is NOT "no cases". Returning [] here would be
+            # indistinguishable from a quiet day and would silently skip the
+            # notification pass; the previous list is left in place so
+            # fill_missing_case_positions keeps working from good data.
+            print("[TRACKED] read failed — skipping this cycle's alert pass "
+                  "rather than treating it as an empty list")
+            return []
+        # Kept so fill_missing_case_positions() can work from the fetch this
+        # function already makes, rather than adding its own.
+        _all_tracked_cases = all_cases
         today = datetime.date.today().isoformat()
         # NOTE: status is deliberately NOT a filter any more.  It used to be
         # `status == "pending"`, which meant announcing a case removed it from
@@ -932,11 +991,74 @@ def _norm_case_key(case_type, case_no, case_year):
     return (ctype, num, yr)
 
 
+# ── Spread the per-court board fetches across the cycle ────────────────────
+# check_notifications fires ALL its per-court board fetches back to back, in
+# well under a second, then the loop sleeps. PHHC does not object to the
+# VOLUME -- aggregate rate is ~0.4 req/s, far under the ~1.4/s the cause-list
+# sweep tolerates -- it objects to the BURST. Confirmed in production
+# 2026-09-14: 30 [BOARD] lines in a five-minute window, 28 of them 429, and
+# concentrated on the most-fetched courts (1, 5 and 8 at ~80% failure). The
+# board sampler had the identical pattern the same morning and lost 35% of its
+# samples until 4s spacing fixed it completely.
+#
+# A refusal is absorbed by the per-(court, date) cache -- we serve the last
+# good payload -- so the damage is staleness, not error: a matter turning "I"
+# may not be seen for minutes, which is a late "your case is up". And the
+# FIRST fetch of a court each day has no cache to fall back on, so a refusal
+# there degrades to arithmetic, the false-called path.
+#
+# WHY THIS DOES NOT DELAY ALERTS: each court is still read exactly once per
+# cycle. Only its position WITHIN the cycle shifts. The interval between two
+# consecutive reads of the same court is unchanged, so expected detection
+# latency is unchanged -- it is a phase shift, not a slowdown.
+#
+# THE BUDGET IS DERIVED, NOT GUESSED. Spacing costs time, and time added to
+# the cycle IS a real slowdown. So the spend is whatever headroom the previous
+# cycle actually left, and it collapses to zero when there is none. This can
+# make the cycle no slower than it already is.
+BOARD_SPACING_MAX = 1.5          # never wait longer than this between fetches
+BOARD_TARGET_CYCLE = 45.0        # period (work + sleep) we decline to exceed
+BOARD_SPACING_FLOOR = 0.2        # below this, spacing is not breaking the burst
+
+_last_cycle_work = 0.0           # seconds of work in the previous cycle
+_board_spacing = 0.0             # seconds between fetches, planned per cycle
+_last_board_fetch = 0.0
+_spacing_warned = False
+
+
+def _plan_board_spacing(n_courts):
+    """Decide the gap between board fetches for this cycle."""
+    global _board_spacing, _spacing_warned
+    if n_courts <= 1:
+        _board_spacing = 0.0
+        return
+    headroom = BOARD_TARGET_CYCLE - SCRAPE_INTERVAL - _last_cycle_work
+    budget = max(3.0, headroom)          # a little spacing is always affordable
+    _board_spacing = min(BOARD_SPACING_MAX, budget / n_courts)
+    if _board_spacing < BOARD_SPACING_FLOOR and not _spacing_warned:
+        print(f"[BOARD] {n_courts} courts leave only {_board_spacing:.2f}s "
+              f"between fetches -- too tight to break the burst. The court "
+              f"count has outgrown the cycle budget; fetch fewer boards per "
+              f"cycle rather than spacing harder.")
+        _spacing_warned = True
+
+
+def _pace_board_fetch():
+    """Wait, if needed, so this fetch is not on the heels of the last one."""
+    global _last_board_fetch
+    if _board_spacing > 0:
+        wait = _board_spacing - (time.time() - _last_board_fetch)
+        if 0 < wait <= BOARD_SPACING_MAX:
+            time.sleep(wait)
+    _last_board_fetch = time.time()
+
+
 def _fetch_board_details(court_number, date_str):
     """Every case on one court's board, or None when nothing trustworthy is
     available.  Never raises."""
     key = (court_number, date_str)
     best = _board_best.get(key)
+    _pace_board_fetch()
     headers = {
         "Referer": "https://new.phhc.gov.in/",
         "Origin": "https://new.phhc.gov.in",
@@ -1216,6 +1338,13 @@ def check_notifications(court_data, existing_records):
     cases = get_tracked_cases()
     if not cases:
         return
+
+    # How many distinct courts will need their board read this cycle? Only
+    # courts that are BOTH on the display board and carry a tracked case are
+    # ever fetched, which is why load scales with sitting courts rather than
+    # with users.
+    _plan_board_spacing(len({c.get("court_number") for c in cases
+                             if c.get("court_number") in court_data}))
 
     for case in cases:
         court_number = case.get("court_number")
@@ -1707,13 +1836,14 @@ def update_case_status(case_id, status, now):
 def reset_daily_flags():
     print("[INFO] Resetting daily notification flags...")
     try:
-        response = requests.get(
-            f"{BASE44_URL}/TrackedCase",
-            headers=HEADERS,
-            timeout=15
-        )
-        response.raise_for_status()
-        cases = response.json()
+        cases = _fetch_tracked_cases()
+        if cases is None:
+            # Resetting a PARTIAL list is worse than not resetting: the cases
+            # that were missed keep yesterday's fired-threshold flags and stay
+            # silent all day. Skip; the next process start tries again.
+            print("[RESET] TrackedCase read failed — skipping the daily reset "
+                  "rather than resetting a partial list")
+            return
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds') + 'Z'
         today = datetime.date.today().isoformat()
         skipped = 0
@@ -2345,11 +2475,10 @@ def sync_tracked_cases_from_cause_list():
     print("[SYNC] Syncing TrackedCase hearing dates from CauseListEntry...")
     try:
         # --- 1. Fetch all TrackedCase records ---
-        resp = requests.get(f"{BASE44_URL}/TrackedCase", headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            print(f"[SYNC] Could not fetch TrackedCase: {resp.status_code}")
+        all_cases = _fetch_tracked_cases()
+        if all_cases is None:
+            print("[SYNC] TrackedCase read failed — skipping this sync")
             return
-        all_cases = resp.json()
         if not all_cases:
             print("[SYNC] No TrackedCase records found.")
             return
@@ -2557,11 +2686,10 @@ def refresh_tracked_cases_from_website():
     """
     print("[WEBREFRESH] Refreshing tracked case details from PHHC website...")
     try:
-        resp = requests.get(f"{BASE44_URL}/TrackedCase", headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            print(f"[WEBREFRESH] Could not fetch TrackedCase: {resp.status_code}")
+        all_cases = _fetch_tracked_cases()
+        if all_cases is None:
+            print("[WEBREFRESH] TrackedCase read failed — skipping this refresh")
             return
-        all_cases = resp.json()
         if not all_cases:
             print("[WEBREFRESH] No TrackedCase records found.")
             return
@@ -3102,6 +3230,7 @@ def main():
     except Exception as e:
         print(f"[MIRROR] startup error (ignored): {e}")
 
+    global _last_cycle_work
     last_run_date = None
     _seed_last_regular_from_db()
 
@@ -3182,6 +3311,10 @@ def main():
                 print(f"[SYNC] Unexpected error: {e}")
 
             _total = round(sum(_t.values()), 1)
+            # The budget for next cycle's board spacing is whatever headroom
+            # this cycle left. Spacing itself is inside _t["alerts"], so it is
+            # self-correcting: overspend once and next cycle spends less.
+            _last_cycle_work = _total
             _slow = " ".join(f"{k}={v}s" for k, v in _t.items() if v >= 0.5)
             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Cycle complete "
                   f"in {_total}s{(' — ' + _slow) if _slow else ''}. "
