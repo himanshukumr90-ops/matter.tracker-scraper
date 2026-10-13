@@ -72,5 +72,48 @@ check("case_no 1394.0 -> 1394", row["case_no"] == 1394 and isinstance(row["case_
 check("court_number 5.0 -> 5", row["court_number"] == 5 and isinstance(row["court_number"], int))
 check("item_number 282.0 -> 282", row["item_number"] == 282)
 
+
+print("\n6. TRACKED CASES mirror unclaimed, and only when something changed")
+m = fresh("https://example.invalid", "k")
+CASE = {"id": "abc123", "user_id": "u-999", "case_type": "CWP", "case_number": "8590",
+        "case_year": 2020, "court_number": 12, "item_number": 34,
+        "case_date": "2026-10-13", "status": "pending", "notified_thresholds": [15.0],
+        "fetched_data_json": '{"a": 1}', "notifications_enabled": True}
+m.mirror_tracked_case(CASE)
+tbl, row = m._q.get_nowait()
+check("goes to tracked_cases", tbl == "tracked_cases", tbl)
+check("carries the Base44 user id as legacy_user_id", row["legacy_user_id"] == "u-999")
+check("NEVER sends user_id (would unclaim a signed-in advocate's cases)",
+      "user_id" not in row, str(sorted(row)[:4]))
+check("fetched_data_json parsed from string to object",
+      row["fetched_data_json"] == {"a": 1}, repr(row["fetched_data_json"]))
+check("notified_thresholds coerced to ints", row["notified_thresholds"] == [15])
+
+m.mirror_tracked_case(CASE)
+check("an unchanged case is NOT re-sent", m._q.qsize() == 0, f"{m._q.qsize()} queued")
+
+moved = dict(CASE, item_number=35)
+m.mirror_tracked_case(moved)
+check("a changed case IS re-sent", m._q.qsize() == 1)
+_, row2 = m._q.get_nowait()
+check("…with the new position", row2["item_number"] == 35)
+
+print("\n7. TRACKED CASE edge cases cannot poison the batch")
+m = fresh("https://example.invalid", "k")
+m.mirror_tracked_case(dict(CASE, status="weird-value"))
+_, row = m._q.get_nowait()
+check("an unknown status becomes pending", row["status"] == "pending", row["status"])
+m.mirror_tracked_case(dict(CASE, id="x2", fetched_data_json="not json{"))
+_, row = m._q.get_nowait()
+check("malformed fetched_data_json becomes null, not a guess",
+      row["fetched_data_json"] is None)
+m.mirror_tracked_case(dict(CASE, id=None))
+check("a case with no id is skipped entirely", m._q.qsize() == 0)
+
+m = fresh()
+for _ in range(5000):
+    m.mirror_tracked_case(CASE)
+check("inert when disabled", m.stats()["queued"] == 0)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

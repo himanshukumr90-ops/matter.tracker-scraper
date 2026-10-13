@@ -466,6 +466,12 @@ def get_tracked_cases():
         # Kept so fill_missing_case_positions() can work from the fetch this
         # function already makes, rather than adding its own.
         _all_tracked_cases = all_cases
+        # Mirror the cases into Supabase off the read we have ALREADY done --
+        # no extra request to Base44. Only what changed is sent, so a quiet
+        # cycle costs nothing. Inert until the Supabase env vars are set, and
+        # it can never raise into the alert pass.
+        for _c in all_cases:
+            supabase_mirror.mirror_tracked_case(_c)
         today = datetime.date.today().isoformat()
         # NOTE: status is deliberately NOT a filter any more.  It used to be
         # `status == "pending"`, which meant announcing a case removed it from

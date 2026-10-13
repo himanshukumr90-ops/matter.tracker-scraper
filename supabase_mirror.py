@@ -47,7 +47,14 @@ CONFLICT = {
                           "case_type,case_no,case_year",
     "court_status": "court_number",
     "staging_notification_logs": "legacy_id",
+    "tracked_cases": "legacy_id",
 }
+
+# Fingerprint of the last version of each case we sent. The alert loop re-reads
+# every TrackedCase each cycle; without this we would re-POST ~633 unchanged
+# rows every 30s (21 writes/second doing nothing). Load should scale with what
+# CHANGES, not with how many cases exist.
+_tc_seen = {}
 
 
 def _i(v):
@@ -199,5 +206,78 @@ def mirror_notification(user_id, case_id, notification_type, message, sent_at):
                 "message": message, "sent_at": sent_at, "source": "mirror"}})
 
 
+def mirror_tracked_case(case):
+    """Mirror one TrackedCase, UNCLAIMED.
+
+    user_id is deliberately absent from the payload. PostgREST's upsert only
+    assigns the columns it is given, so leaving it out means a row already
+    claimed by a signed-in advocate keeps its owner — including it as null
+    would hand their cases back to nobody on the next cycle.
+
+    ⚠️ TURN THIS OFF AT CUT-OVER. Once the app writes cases to Supabase, Base44
+    becomes the stale copy and this would overwrite live edits with old data.
+    Clearing SUPABASE_URL/SUPABASE_SERVICE_KEY stops it without a deploy.
+    """
+    if not ENABLED:
+        return
+    legacy_id = _s(case.get("id"))
+    if legacy_id is None:
+        return
+    status = _s(case.get("status"))
+    thresholds = [x for x in (_i(v) for v in (case.get("notified_thresholds") or []))
+                  if x is not None]
+    fetched = case.get("fetched_data_json")
+    if isinstance(fetched, str):
+        try:
+            fetched = json.loads(fetched) if fetched.strip() else None
+        except ValueError:
+            fetched = None                    # malformed on Base44; do not guess
+
+    row = {
+        "legacy_id": legacy_id,
+        "legacy_user_id": _s(case.get("user_id")),
+        "case_type": _s(case.get("case_type")),
+        "case_number": _s(case.get("case_number")),
+        "case_year": _i(case.get("case_year")),
+        "case_title": _s(case.get("case_title")),
+        "case_status": _s(case.get("case_status")),
+        "petitioner_name": _s(case.get("petitioner_name")),
+        "respondent_name": _s(case.get("respondent_name")),
+        "petitioner_advocate": _s(case.get("petitioner_advocate")),
+        "respondent_advocate": _s(case.get("respondent_advocate")),
+        "next_hearing_date": _s(case.get("next_hearing_date")),
+        "registration_date": _s(case.get("registration_date")),
+        "listing_date": _s(case.get("listing_date")),
+        "disposal_date": _s(case.get("disposal_date")),
+        "final_order_date": _s(case.get("final_order_date")),
+        "court_number": _i(case.get("court_number")),
+        "item_number": _i(case.get("item_number")),
+        "case_date": _s(case.get("case_date")),
+        "cnr_no": _s(case.get("cnr_no")), "bench": _s(case.get("bench")),
+        "district": _s(case.get("district")), "category": _s(case.get("category")),
+        "order_link": _s(case.get("order_link")),
+        "diary_number": _s(case.get("diary_number")),
+        "is_disposed": bool(case.get("is_disposed")),
+        "fetched_data_json": fetched,
+        "notify_at_15": bool(case.get("notify_at_15", True)),
+        "notify_at_10": bool(case.get("notify_at_10", True)),
+        "notify_at_5": bool(case.get("notify_at_5", True)),
+        "notified_thresholds": thresholds,
+        "notifications_enabled": bool(case.get("notifications_enabled", True)),
+        "notify_passover_always": bool(case.get("notify_passover_always")),
+        # the destination constrains status; anything else becomes pending
+        "status": status if status in ("pending", "called", "not_listed", "passover")
+                  else "pending",
+        "notes": _s(case.get("notes")),
+    }
+
+    fingerprint = json.dumps(row, sort_keys=True, default=str)
+    if _tc_seen.get(legacy_id) == fingerprint:
+        return
+    _tc_seen[legacy_id] = fingerprint
+    _put("tracked_cases", row)
+
+
 def stats():
-    return dict(_stats, backlog=_q.qsize(), enabled=ENABLED)
+    return dict(_stats, backlog=_q.qsize(), enabled=ENABLED,
+                tracked_cached=len(_tc_seen))
