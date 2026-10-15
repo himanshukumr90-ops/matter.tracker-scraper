@@ -32,10 +32,27 @@ BASE44_URL = f"https://preview--matter-track-pro.base44.app/api/apps/{APP_ID}/en
 DISPLAY_BOARD_URL = "https://mattertracker-api.vercel.app/phhc/display_board/public/getRecords?skip=0&limit=500"
 SCRAPE_INTERVAL = 30
 THRESHOLDS = [15, 10, 5]
-HEADERS = {
-    "api_key": API_KEY,
-    "Content-Type": "application/json"
-}
+# ── Base44 auth: personal access token, falling back to the old API key ─────
+# Base44 switch off app/account API keys on 2026-10-15 ("final notice" email).
+# The replacement is a personal access token sent as a bearer token.
+#
+# Both are supported ON PURPOSE. This can be deployed BEFORE the token exists,
+# and the moment BASE44_PAT is set on Railway the scraper starts using it with
+# no further deploy — and if the token is ever wrong, clearing that one
+# variable falls straight back. The alternative, a flag-day swap of code and
+# credential at once, risks the alert loop going dark on a court day.
+BASE44_PAT = os.environ.get("BASE44_PAT", "")
+
+
+def _base44_headers():
+    h = {"Content-Type": "application/json"}
+    if BASE44_PAT:
+        h["Authorization"] = f"Bearer {BASE44_PAT}"
+    else:
+        h["api_key"] = API_KEY
+    return h
+
+HEADERS = _base44_headers()
 
 # Cause list + display board go through our Vercel bom1 relay (/phhc/*):
 IST = timezone(timedelta(hours=5, minutes=30))

@@ -33,7 +33,13 @@ except ImportError:  # dependency missing — feature stays off
 APP_ID = os.environ.get("BASE44_APP_ID", "YOUR_APP_ID_HERE")
 API_KEY = os.environ.get("BASE44_API_KEY", "YOUR_API_KEY_HERE")
 BASE44_URL = f"https://preview--matter-track-pro.base44.app/api/apps/{APP_ID}/entities"
-HEADERS = {"api_key": API_KEY, "Content-Type": "application/json"}
+# See scraper.py: Base44 replaced API keys with personal access tokens on
+# 2026-10-15. Prefer the token; fall back to the key so this is deployable
+# before the token exists.
+BASE44_PAT = os.environ.get("BASE44_PAT", "")
+HEADERS = ({"Authorization": f"Bearer {BASE44_PAT}", "Content-Type": "application/json"}
+           if BASE44_PAT else
+           {"api_key": API_KEY, "Content-Type": "application/json"})
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
